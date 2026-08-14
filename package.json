@@ -1,6 +1,6 @@
 {
   "name": "ompup",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Continue local Oh My Pi projects on the best available persistent remote machine",
   "license": "MIT",
   "repository": {
@@ -11,7 +11,7 @@
     "ompup": "./bin/ompup"
   },
   "scripts": {
-    "test": "python3 -m unittest -v tests/test_hosts.py"
+    "test": "python3 -m unittest discover -s tests -v"
   },
   "omp": {
     "extensions": ["./extension/index.ts"]

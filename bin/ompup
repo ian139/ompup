@@ -41,7 +41,7 @@ from ompup.hosts import (  # noqa: E402
     unpin_host,
 )
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 LEGACY_HOST = os.environ.get("OMPUP_HOST", "")
 REMOTE_ROOT = os.environ.get("OMPUP_REMOTE_ROOT", "Projects").strip("/")
 LAUNCH_OVERRIDE = os.environ.get("OMPUP_CMD", "")
@@ -150,6 +150,81 @@ bundle="$HOME/$2"
 branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD)
 git -C "$repo" bundle create "$bundle" "refs/heads/$branch" >/dev/null
 printf '%s\n' "$branch"
+"""
+
+PREPARE_HANDOFF_SCRIPT = r"""
+set -euo pipefail
+target="$HOME/$1"
+umask 077
+rm -rf "$target"
+mkdir -p "$target"
+chmod 700 "$target"
+"""
+
+VERIFY_HANDOFF_SCRIPT = r"""
+set -euo pipefail
+target="$HOME/$1"
+expected="$2"
+launch="$3"
+session_file="$target/session.jsonl"
+case "$launch" in
+  '$HOME/'*) launch="$HOME/${launch#\$HOME/}" ;;
+  '~/'*) launch="$HOME/${launch#\~/}" ;;
+esac
+actual=$(python3 - "$session_file" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+)
+[ "$actual" = "$expected" ] || {
+  printf 'session checksum mismatch: expected=%s actual=%s\n' "$expected" "$actual" >&2
+  exit 5
+}
+chmod 600 "$session_file"
+[ ! -d "$target/session" ] || chmod -R go-rwx "$target/session"
+validation_dir=$(mktemp -d "$target/.validate.XXXXXX")
+trap 'rm -rf "$validation_dir"' EXIT
+(
+  cd "$validation_dir"
+  "$launch" --export "$session_file" >/dev/null
+)
+"""
+
+START_HANDOFF_SCRIPT = r"""
+set -euo pipefail
+repo="$HOME/$1"
+session="$2"
+session_file="$HOME/$3"
+launch="$4"
+case "$launch" in
+  '$HOME/'*) launch="$HOME/${launch#\$HOME/}" ;;
+  '~/'*) launch="$HOME/${launch#\~/}" ;;
+esac
+tmux has-session -t "=$session" 2>/dev/null && {
+  printf 'tmux session already exists: %s\n' "$session" >&2
+  exit 4
+}
+printf -v command '%q ' "$launch" --cwd "$repo" --resume "$session_file"
+tmux new-session -d -s "$session" -c "$repo" "$command"
+sleep 2
+tmux has-session -t "=$session" 2>/dev/null || {
+  printf 'remote OMP exited before becoming attachable\n' >&2
+  exit 6
+}
+"""
+
+CLEANUP_HANDOFF_SCRIPT = r"""
+set -euo pipefail
+if [ "$3" = 1 ]; then tmux kill-session -t "=$1" 2>/dev/null || true; fi
+rm -rf "$HOME/$2"
 """
 
 
@@ -633,6 +708,19 @@ def create_parser() -> argparse.ArgumentParser:
     ):
         subparser = commands.add_parser(name, help=help_text)
         add_project_arguments(subparser, cmux=name in {"up", "shell"})
+    handoff_parser = commands.add_parser(
+        "handoff",
+        help="move a live local OMP session into remote tmux and replace its cmux surface",
+    )
+    add_project_arguments(handoff_parser)
+    handoff_parser.add_argument("--session-file", required=True, help=argparse.SUPPRESS)
+    handoff_parser.add_argument("--artifacts-dir", default="", help=argparse.SUPPRESS)
+    handoff_parser.add_argument("--session-id", required=True, help=argparse.SUPPRESS)
+    handoff_parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="prepare and verify remote OMP without replacing the local terminal",
+    )
     hosts_parser = commands.add_parser("hosts", help="probe every configured host")
     hosts_parser.add_argument("--json", action="store_true", help="emit probe data as JSON")
     pin_parser = commands.add_parser("pin", help="pin a project to one configured host")
@@ -647,7 +735,7 @@ def create_parser() -> argparse.ArgumentParser:
 
 def parse_args() -> argparse.Namespace:
     argv = sys.argv[1:]
-    commands = {"up", "shell", "sync", "pull", "status", "doctor", "hosts", "pin", "unpin"}
+    commands = {"up", "shell", "sync", "pull", "status", "doctor", "hosts", "pin", "unpin", "handoff"}
     if not argv:
         argv = ["up"]
     elif argv[0] not in commands and argv[0] not in {"-h", "--help", "--version"}:
@@ -787,6 +875,183 @@ def open_cmux(root: Path, project: str, host_name: str, command: str) -> None:
         ]
     )
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_handoff_launch(launch: str) -> None:
+    if not re.fullmatch(r"(?:\$HOME/|~/|/)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", launch):
+        die("handoff requires the selected host launch setting to be one executable path")
+
+
+def ensure_cmux_runtime() -> None:
+    if shutil.which("cmux") is None:
+        die("session handoff requires cmux")
+    if run(["cmux", "ping"], check=False, capture=True).returncode != 0:
+        die("session handoff requires a live cmux runtime")
+
+
+def cmux_caller() -> tuple[str, str] | None:
+    result = run(["cmux", "identify"], check=False, capture=True)
+    if result.returncode != 0:
+        return None
+    try:
+        caller = json.loads(result.stdout).get("caller")
+    except json.JSONDecodeError:
+        return None
+    if not caller or caller.get("surface_type") != "terminal":
+        return None
+    window = caller.get("window_ref")
+    surface = caller.get("surface_ref")
+    if not isinstance(window, str) or not isinstance(surface, str):
+        return None
+    return window, surface
+
+
+def handoff_attach_command(session: str) -> str:
+    remote_command = f"tmux attach-session -t {shlex.quote('=' + session)}"
+    ssh = " ".join(shlex.quote(part) for part in ("ssh", "-t", REMOTE, remote_command))
+    return f'{ssh}; exec "$SHELL" -l'
+
+
+def replace_or_open_cmux(root: Path, project: str, host_name: str, session: str) -> str:
+    command = handoff_attach_command(session)
+    caller = cmux_caller()
+    if caller:
+        window, surface = caller
+        result = run(
+            [
+                "cmux",
+                "respawn-pane",
+                "--window",
+                window,
+                "--surface",
+                surface,
+                "--command",
+                command,
+            ],
+            check=False,
+            capture=True,
+        )
+        if result.returncode == 0:
+            return "replaced current cmux surface"
+
+    run(
+        [
+            "cmux",
+            "workspace",
+            "create",
+            "--name",
+            f"ompup:{project}@{host_name}",
+            "--description",
+            f"Handed-off OMP session on {host_name}",
+            "--cwd",
+            str(root),
+            "--command",
+            command,
+            "--focus",
+            "true",
+        ]
+    )
+    if caller:
+        window, surface = caller
+        closed = run(
+            ["cmux", "close-surface", "--window", window, "--surface", surface],
+            check=False,
+            capture=True,
+        )
+        if closed.returncode == 0:
+            return "opened fallback cmux workspace and closed the local surface"
+    return "opened fallback cmux workspace"
+
+
+def cleanup_handoff(session: str, handoff_dir: str, *, kill_session: bool) -> None:
+    ssh_script(CLEANUP_HANDOFF_SCRIPT, session, handoff_dir, "1" if kill_session else "0", check=False)
+
+
+def handoff_session(
+    root: Path,
+    project: str,
+    remote_dir: str,
+    session: str,
+    state_key: str,
+    identity: str,
+    origin: str,
+    choice: HostChoice,
+    args: argparse.Namespace,
+) -> None:
+    session_file = Path(args.session_file).expanduser().resolve()
+    if not session_file.is_file() or session_file.suffix != ".jsonl":
+        die("active OMP session file is missing or is not JSONL")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.session_id):
+        die("active OMP session ID is not safe for remote storage")
+    artifacts_dir = Path(args.artifacts_dir).expanduser().resolve() if args.artifacts_dir else None
+    if artifacts_dir and artifacts_dir.exists() and (not artifacts_dir.is_dir() or artifacts_dir.is_symlink()):
+        die("active OMP artifact path is not a regular directory")
+    validate_handoff_launch(LAUNCH)
+    if not args.prepare_only:
+        ensure_cmux_runtime()
+    if session_exists(session):
+        die(f"remote tmux session {session!r} already exists; attach it or choose another host")
+
+    sync_up(root, project, state_key, remote_dir, identity, origin)
+    if session_exists(session):
+        die(f"remote tmux session {session!r} appeared during synchronization; local OMP was preserved")
+
+    handoff_dir = f".local/state/ompup/handoffs/{project}/{args.session_id}"
+    remote_session_file = f"{handoff_dir}/session.jsonl"
+    source_hash = file_sha256(session_file)
+    ssh_script(PREPARE_HANDOFF_SCRIPT, handoff_dir)
+    remote_started = False
+    try:
+        run(["rsync", "-a", str(session_file), f"{REMOTE}:{remote_session_file}"])
+        if artifacts_dir and artifacts_dir.is_dir():
+            run(["rsync", "-a", str(artifacts_dir) + os.sep, f"{REMOTE}:{handoff_dir}/session/"])
+        if file_sha256(session_file) != source_hash:
+            die("local OMP session changed during transfer; local OMP was preserved")
+
+        verified = ssh_script(
+            VERIFY_HANDOFF_SCRIPT,
+            handoff_dir,
+            source_hash,
+            LAUNCH,
+            check=False,
+            capture=True,
+        )
+        if verified.returncode != 0:
+            detail = verified.stderr.strip().splitlines()[-1] if verified.stderr.strip() else "remote export failed"
+            die(f"remote OMP could not load the transferred session: {detail}")
+
+        started = ssh_script(
+            START_HANDOFF_SCRIPT,
+            remote_dir,
+            session,
+            remote_session_file,
+            LAUNCH,
+            check=False,
+            capture=True,
+        )
+        if started.returncode != 0:
+            detail = started.stderr.strip().splitlines()[-1] if started.stderr.strip() else "remote OMP did not stay running"
+            die(f"remote OMP did not become attachable: {detail}")
+        remote_started = True
+
+        if args.prepare_only:
+            print(
+                f"ompup: remote session ready on {choice.host.name}; "
+                f"attach with `ssh -t {REMOTE} {shlex.quote(f'tmux attach-session -t ={session}')}`"
+            )
+            return
+        mode = replace_or_open_cmux(root, project, choice.host.name, session)
+        print(f"ompup: {mode}; remote session {args.session_id} verified")
+    except BaseException:
+        cleanup_handoff(session, handoff_dir, kill_session=remote_started)
+        raise
+
 
 def run_doctor(root: Path, project: str, args: argparse.Namespace) -> None:
     choice, probes, remote_dir, session, _ = host_context(
@@ -837,6 +1102,19 @@ def main() -> None:
         print_banner(root, project, choice, profile)
         if getattr(args, "cmux", False):
             open_cmux(root, project, choice.host.name, args.command)
+            return
+        if args.command == "handoff":
+            handoff_session(
+                root,
+                project,
+                remote_dir,
+                session,
+                state_key,
+                identity,
+                origin,
+                choice,
+                args,
+            )
             return
         if args.command == "status":
             show_status(root, state_key, remote_dir, identity, session)

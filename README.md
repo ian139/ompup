@@ -2,24 +2,25 @@
 
 Jump from any local project into a persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) session on the best available remote machine.
 
-ompup probes configured hosts, honors project and workload affinity, pins the first placement, transfers Git commits and uncommitted state safely, attaches a project-named tmux session, and launches `omp`. Later commands reattach a live session without mutating its checkout.
+ompup probes configured hosts, honors project and workload affinity, pins the first placement, transfers Git commits and uncommitted state safely, attaches a project-named tmux session, and launches `omp`. The `/ompup handoff` extension command also moves the current live conversation into remote tmux and replaces its cmux surface in place.
 
 ```bash
 ompup                       # current Git project
 ompup UFC-pokedex           # named project from any directory
 ompup --pick                # interactive project picker
 ompup --cmux                # open or reuse a cmux workspace
+/ompup handoff              # from inside local omp running in cmux
 ```
 
 ## How it works
 
 ```text
-local Git history ──bundle, first run only──> ~/Projects/<name>
-local working tree ──verified snapshot──────>        │
-                                                     │
-                                               tmux new -A
-                                                     │
-                                                    omp
+local Git history ──verified bundle/snapshot──> ~/Projects/<name>
+local session JSONL + artifacts ──────────────> ~/.local/state/ompup/handoffs/...
+                                                         │
+                                                   tmux + omp --resume
+                                                         │
+                                                   cmux SSH surface
 ```
 
 - Git history moves through verified Git bundles. Fast-forward commits transfer automatically in either direction; divergent history fails visibly.
@@ -28,10 +29,11 @@ local working tree ──verified snapshot──────>        │
 - The first transfer scans reachable history and every transfer scans its working snapshot with `gitleaks`.
 - An existing tmux session is reattached without synchronizing files beneath the running process. Use `ompup sync` explicitly when you want a later local change transferred.
 - Host selection is sticky. Live capacity chooses the first placement; the project remains pinned until `ompup unpin`.
+- A live handoff waits for OMP to become idle, syncs the project, copies the session and artifacts into a private remote state directory, verifies the checksum and remote export, and starts OMP in tmux. Only then does cmux replace the local surface.
 
 ## Requirements
 
-- Local: Python 3.12 or newer, `ssh`, `rsync`, `git`, and `gitleaks`
+- Local: Python 3.12 or newer, `ssh`, `rsync`, `git`, and `gitleaks`; cmux is required for live session handoff
 - Remote: Python 3, Bash, `tmux`, `rsync`, `git`, and `omp`
 - An SSH host or alias that reaches your box (an entry in `~/.ssh/config` works well)
 
@@ -47,7 +49,7 @@ mkdir -p ~/.config/ompup
 
 ### Oh My Pi extension
 
-The same repo is an omp plugin. It adds `/ompup sync`, `/ompup pull`, and `/ompup status` inside a session, so an agent or you can push the current project to the box without leaving omp. The interactive jump stays in the CLI, since a running TUI cannot hand its terminal to a remote tmux.
+The same repo is an omp plugin. It adds `/ompup sync`, `/ompup pull`, `/ompup status`, and `/ompup handoff`. Handoff resumes the exact persisted conversation on the selected host, replaces the calling cmux surface with SSH attached to remote tmux, and shuts down the local OMP process.
 
 ```bash
 omp plugin link ./ompup      # from the clone
@@ -74,6 +76,8 @@ omp --extension ./ompup/extension/index.ts
 | `ompup unpin [PROJECT]` | Return a project to automatic placement |
 | `ompup shell [PROJECT]` | Bootstrap or sync when needed, then attach a plain shell |
 | `ompup [PROJECT] --cmux` | Open or reuse a named cmux workspace for the remote session |
+| `/ompup handoff` | Wait for idle, transfer and verify this session, start remote OMP, then replace the current cmux surface |
+| `/ompup handoff --host HOST` | Hand the session to a specific configured host |
 
 ## Host configuration
 
@@ -137,9 +141,12 @@ The capacity score uses declared roles, minimum free-space reserves, free disk, 
 
 - Project names resolve from the current Git repository, an explicit path, or a case-insensitive directory under `OMPUP_PROJECTS_ROOT`.
 - The repository directory name also becomes the tmux session name.
-- Quitting omp drops to a shell inside the session instead of killing it.
+- In sessions created by `ompup up`, quitting omp drops to a remote shell instead of killing tmux.
 - Fast-forward commits transfer automatically. Divergent history requires normal Git reconciliation.
 - `ompup pull` may delete local paths to reproduce the remote snapshot, but only when the local checkout exactly matches the recorded baseline.
+- A successful handoff keeps the local session file as a rollback copy. A failed transfer, checksum, remote load, launch, or cmux replacement leaves local OMP running and removes only remote state created by that attempt.
+- Handoff refuses to overwrite an existing project tmux session. Attach that session or select another host.
+- If cmux cannot respawn the calling surface, ompup opens a focused fallback workspace and closes the old surface when cmux can identify it.
 
 ## License
 
