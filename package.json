@@ -1,6 +1,6 @@
 {
   "name": "ompup",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Continue local Oh My Pi projects on the best available persistent remote machine",
   "license": "MIT",
   "repository": {

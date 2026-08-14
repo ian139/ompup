@@ -24,6 +24,17 @@ import tarfile
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from ompup.environment import (  # noqa: E402
+    bootstrap_auth,
+    build_release,
+    cleanup_release,
+    ensure_environment,
+    environment_status,
+    format_environment_status,
+    load_environment_config,
+    select_hosts,
+    sync_environment,
+)
 
 from ompup.hosts import (  # noqa: E402
     HostChoice,
@@ -41,7 +52,7 @@ from ompup.hosts import (  # noqa: E402
     unpin_host,
 )
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 LEGACY_HOST = os.environ.get("OMPUP_HOST", "")
 REMOTE_ROOT = os.environ.get("OMPUP_REMOTE_ROOT", "Projects").strip("/")
 LAUNCH_OVERRIDE = os.environ.get("OMPUP_CMD", "")
@@ -204,6 +215,7 @@ repo="$HOME/$1"
 session="$2"
 session_file="$HOME/$3"
 launch="$4"
+fingerprint="$5"
 case "$launch" in
   '$HOME/'*) launch="$HOME/${launch#\$HOME/}" ;;
   '~/'*) launch="$HOME/${launch#\~/}" ;;
@@ -214,6 +226,7 @@ tmux has-session -t "=$session" 2>/dev/null && {
 }
 printf -v command '%q ' "$launch" --cwd "$repo" --resume "$session_file"
 tmux new-session -d -s "$session" -c "$repo" "$command"
+tmux set-option -t "$session" @ompup-environment "$fingerprint"
 sleep 2
 tmux has-session -t "=$session" 2>/dev/null || {
   printf 'remote OMP exited before becoming attachable\n' >&2
@@ -668,13 +681,35 @@ def show_status(
     print(f"session {session} is {'running' if session_exists(session) else 'not running'}")
 
 
-def attach(session: str, remote_dir: str, launch: str) -> None:
-    command = (
-        f"tmux new-session -A -s {shlex.quote(session)} "
+def session_environment(session: str) -> str:
+    result = ssh_command(
+        f"tmux show-options -v -t {shlex.quote(session)} @ompup-environment",
+        check=False,
+        capture=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def attach(session: str, remote_dir: str, launch: str, fingerprint: str) -> None:
+    quoted_session = shlex.quote(session)
+    quoted_target = shlex.quote("=" + session)
+    quoted_option_target = shlex.quote(session)
+    create = (
+        f"tmux new-session -d -s {quoted_session} "
         f'-c \"$HOME/{remote_dir}\"'
     )
     if launch:
-        command += " " + shlex.quote(f'{launch}; exec \"$SHELL\"')
+        create += " " + shlex.quote(f'{launch}; exec \"$SHELL\"')
+    command = (
+        f"if tmux has-session -t {quoted_target} 2>/dev/null; then "
+        f"actual=$(tmux show-options -v -t {quoted_option_target} @ompup-environment 2>/dev/null || true); "
+        f"[ \"$actual\" = {shlex.quote(fingerprint)} ] || "
+        f"{{ printf 'tmux session environment mismatch\\n' >&2; exit 7; }}; "
+        f"exec tmux attach-session -t {quoted_target}; fi; "
+        f"{create}; "
+        f"tmux set-option -t {quoted_option_target} @ompup-environment {shlex.quote(fingerprint)}; "
+        f"exec tmux attach-session -t {quoted_target}"
+    )
     os.execvp("ssh", ["ssh", "-t", REMOTE, command])
 
 
@@ -730,12 +765,29 @@ def create_parser() -> argparse.ArgumentParser:
     unpin_parser = commands.add_parser("unpin", help="remove a project's host pin")
     unpin_parser.add_argument("project", nargs="?")
     unpin_parser.add_argument("--pick", action="store_true")
+    env_parser = commands.add_parser("env", help="manage shared OMP environment parity")
+    env_commands = env_parser.add_subparsers(dest="env_command", required=True)
+    for name, help_text in (
+        ("status", "compare shared OMP configuration on remote machines"),
+        ("sync", "synchronize shared OMP configuration to remote machines"),
+    ):
+        env_subparser = env_commands.add_parser(name, help=help_text)
+        env_subparser.add_argument("--host", action="append", default=[], help="configured host name or SSH destination")
+        env_subparser.add_argument("--all", action="store_true", help="target every configured host")
+        if name == "status":
+            env_subparser.add_argument("--json", action="store_true", help="emit status as JSON")
+    auth_parser = commands.add_parser("auth", help="configure and verify the shared OMP auth broker")
+    auth_commands = auth_parser.add_subparsers(dest="auth_command", required=True)
+    auth_commands.add_parser("setup", help="provision the broker token and configure this machine")
+    auth_commands.add_parser("status", help="verify local broker authentication")
+    migrate_parser = auth_commands.add_parser("migrate", help="migrate local stored credentials to the broker")
+    migrate_parser.add_argument("--dry-run", action="store_true", help="show migrations without writing")
     return parser
 
 
 def parse_args() -> argparse.Namespace:
     argv = sys.argv[1:]
-    commands = {"up", "shell", "sync", "pull", "status", "doctor", "hosts", "pin", "unpin", "handoff"}
+    commands = {"up", "shell", "sync", "pull", "status", "doctor", "hosts", "pin", "unpin", "handoff", "env", "auth"}
     if not argv:
         argv = ["up"]
     elif argv[0] not in commands and argv[0] not in {"-h", "--help", "--version"}:
@@ -983,6 +1035,7 @@ def handoff_session(
     origin: str,
     choice: HostChoice,
     args: argparse.Namespace,
+    environment_fingerprint: str,
 ) -> None:
     session_file = Path(args.session_file).expanduser().resolve()
     if not session_file.is_file() or session_file.suffix != ".jsonl":
@@ -1032,6 +1085,7 @@ def handoff_session(
             session,
             remote_session_file,
             LAUNCH,
+            environment_fingerprint,
             check=False,
             capture=True,
         )
@@ -1064,6 +1118,102 @@ def run_doctor(root: Path, project: str, args: argparse.Namespace) -> None:
     print(f"remote path ~/{remote_dir}; tmux session {session}")
 
 
+def run_environment_command(args: argparse.Namespace) -> None:
+    hosts = load_hosts(LEGACY_HOST)
+    selected = select_hosts(hosts, args.host, args.all)
+    config = load_environment_config()
+    release = build_release(config.broker_url)
+    try:
+        if args.env_command == "status":
+            statuses = [environment_status(host) for host in selected]
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "fingerprint": release.fingerprint,
+                            "ompVersion": release.manifest["ompVersion"],
+                            "hostLocal": release.manifest["hostLocal"],
+                            "excludedExtensions": release.manifest["excludedExtensions"],
+                            "hosts": [
+                                {
+                                    "name": status.host.name,
+                                    "reachable": status.reachable,
+                                    "ok": status.ok and status.fingerprint == release.fingerprint,
+                                    "fingerprint": status.fingerprint,
+                                    "ompVersion": status.omp_version,
+                                    "mismatches": status.mismatches,
+                                    "error": status.error,
+                                }
+                                for status in statuses
+                            ],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"local: {release.fingerprint[:12]} ({release.manifest['ompVersion']})")
+                for status in statuses:
+                    print(format_environment_status(status, release.fingerprint))
+                if release.manifest["excludedExtensions"]:
+                    print("host-local extensions: " + ", ".join(release.manifest["excludedExtensions"]))
+            return
+
+        bootstrap_auth(hosts)
+        token_path = Path.home() / ".omp/auth-broker.token"
+        token = token_path.read_bytes()
+        failures: list[str] = []
+        for host in selected:
+            current = environment_status(host)
+            if (
+                current.ok
+                and current.fingerprint == release.fingerprint
+                and current.omp_version == release.manifest["ompVersion"]
+            ):
+                print(format_environment_status(current, release.fingerprint))
+                continue
+            try:
+                status = sync_environment(host, release, token)
+                print(format_environment_status(status, release.fingerprint))
+            except RuntimeError as error:
+                failures.append(f"{host.name}: {error}")
+                print(f"ompup: {host.name}: {error}", file=sys.stderr)
+        if failures:
+            raise RuntimeError(f"environment sync failed for {len(failures)} host(s)")
+    finally:
+        cleanup_release(release)
+
+
+def run_auth_command(args: argparse.Namespace) -> None:
+    hosts = load_hosts(LEGACY_HOST)
+    if args.auth_command == "setup":
+        config, changed = bootstrap_auth(hosts)
+        print(f"ompup: broker configured at {config.broker_url}" + ("; local config updated" if changed else ""))
+    elif args.auth_command == "migrate":
+        bootstrap_auth(hosts)
+        command = ["omp", "auth-broker", "migrate", "--from-local", "--include-oauth"]
+        if args.dry_run:
+            command.append("--dry-run")
+        run(command)
+        return
+    run(["omp", "auth-broker", "status", "--json"])
+
+
+def verify_selected_environment(choice: HostChoice, session: str):
+    status = ensure_environment(choice.host)
+    print(f"ompup: environment {status.fingerprint[:12]} verified on {choice.host.name}")
+    if choice.probe.session_exists:
+        actual = session_environment(session)
+        if actual != status.fingerprint:
+            die(
+                f"remote tmux session {session!r} was started with environment "
+                f"{actual[:12] if actual else 'unknown'}; quit it before attaching "
+                f"with environment {status.fingerprint[:12]}"
+            )
+    return status
+
+
+
+
 def main() -> None:
     global LAUNCH, REMOTE
     args = parse_args()
@@ -1071,6 +1221,12 @@ def main() -> None:
     try:
         if args.command == "hosts":
             show_hosts(args.json)
+            return
+        if args.command == "env":
+            run_environment_command(args)
+            return
+        if args.command == "auth":
+            run_auth_command(args)
             return
         root = resolve_project(getattr(args, "project", "") or "", getattr(args, "pick", False))
         project = root.name
@@ -1099,11 +1255,15 @@ def main() -> None:
         )
         profile = project_profile(root, args.profile)
         identity, origin = project_identity(root)
-        print_banner(root, project, choice, profile)
+        selected_environment = None
+        if args.command in {"up", "handoff"}:
+            selected_environment = verify_selected_environment(choice, session)
         if getattr(args, "cmux", False):
             open_cmux(root, project, choice.host.name, args.command)
             return
         if args.command == "handoff":
+            if selected_environment is None:
+                die("shared environment was not verified")
             handoff_session(
                 root,
                 project,
@@ -1114,6 +1274,7 @@ def main() -> None:
                 origin,
                 choice,
                 args,
+                selected_environment.fingerprint,
             )
             return
         if args.command == "status":
@@ -1130,8 +1291,13 @@ def main() -> None:
             print("ompup: existing tmux session found; attaching without changing its checkout")
         else:
             sync_up(root, project, state_key, remote_dir, identity, origin)
-        attach(session, remote_dir, "" if args.command == "shell" else LAUNCH)
-    except HostSelectionError as error:
+        attach(
+            session,
+            remote_dir,
+            "" if args.command == "shell" else LAUNCH,
+            selected_environment.fingerprint if selected_environment else "",
+        )
+    except (HostSelectionError, RuntimeError) as error:
         die(str(error))
 
 

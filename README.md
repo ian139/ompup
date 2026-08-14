@@ -2,7 +2,7 @@
 
 Jump from any local project into a persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) session on the best available remote machine.
 
-ompup probes configured hosts, honors project and workload affinity, pins the first placement, transfers Git commits and uncommitted state safely, attaches a project-named tmux session, and launches `omp`. The `/ompup handoff` extension command also moves the current live conversation into remote tmux and replaces its cmux surface in place.
+ompup probes configured hosts, honors project and workload affinity, pins the first placement, aligns the shared OMP environment, transfers Git commits and uncommitted state safely, attaches a project-named tmux session, and launches `omp`. The `/ompup handoff` extension command also moves the current live conversation into remote tmux and replaces its cmux surface in place.
 
 ```bash
 ompup                       # current Git project
@@ -10,6 +10,9 @@ ompup UFC-pokedex           # named project from any directory
 ompup --pick                # interactive project picker
 ompup --cmux                # open or reuse a cmux workspace
 /ompup handoff              # from inside local omp running in cmux
+ompup env status --all      # verify OMP config, skills, agents, extensions, and plugins
+ompup env sync --all        # align every reachable machine
+ompup auth status           # verify the shared credential broker
 ```
 
 ## How it works
@@ -30,10 +33,11 @@ local session JSONL + artifacts ──────────────> ~/.l
 - An existing tmux session is reattached without synchronizing files beneath the running process. Use `ompup sync` explicitly when you want a later local change transferred.
 - Host selection is sticky. Live capacity chooses the first placement; the project remains pinned until `ompup unpin`.
 - A live handoff waits for OMP to become idle, syncs the project, copies the session and artifacts into a private remote state directory, verifies the checksum and remote export, and starts OMP in tmux. Only then does cmux replace the local surface.
+- Before an OMP launch or live handoff, the selected machine must match the local environment fingerprint and OMP version. Each tmux session records the fingerprint it started with, so an older live process cannot be mistaken for a current environment.
 
 ## Requirements
 
-- Local: Python 3.12 or newer, `ssh`, `rsync`, `git`, and `gitleaks`; cmux is required for live session handoff
+- Local: Python 3.12 or newer, `ssh`, `rsync`, `git`, `gitleaks`, and `yq`; cmux is required for live session handoff
 - Remote: Python 3, Bash, `tmux`, `rsync`, `git`, and `omp`
 - An SSH host or alias that reaches your box (an entry in `~/.ssh/config` works well)
 
@@ -78,6 +82,11 @@ omp --extension ./ompup/extension/index.ts
 | `ompup [PROJECT] --cmux` | Open or reuse a named cmux workspace for the remote session |
 | `/ompup handoff` | Wait for idle, transfer and verify this session, start remote OMP, then replace the current cmux surface |
 | `/ompup handoff --host HOST` | Hand the session to a specific configured host |
+| `ompup env status --all` | Compare the local shared-environment fingerprint with every configured host |
+| `ompup env sync --all` | Update OMP, transfer the safe declarative environment, provision broker tokens over SSH, and verify each reachable host |
+| `ompup auth setup` | Copy the broker bearer token over SSH into a local mode-0600 file and configure the broker URL |
+| `ompup auth status` | Verify authenticated broker access without printing the token |
+| `ompup auth migrate [--dry-run]` | Move local stored credentials, including OAuth accounts, into the broker |
 
 ## Host configuration
 
@@ -89,7 +98,7 @@ Create `~/.config/ompup/hosts.json`:
     {
       "name": "compute",
       "ssh": "compute-box",
-      "roles": ["general", "linux"],
+      "roles": ["general", "linux", "auth"],
       "reserve_gb": 40,
       "priority": 0,
       "launch": "omp"
@@ -110,7 +119,11 @@ Create `~/.config/ompup/hosts.json`:
       "priority": 0,
       "launch": "$HOME/.local/bin/omp"
     }
-  ]
+  ],
+  "environment": {
+    "auth_host": "compute",
+    "auth_broker_url": "http://100.64.0.10:8765"
+  }
 }
 ```
 
@@ -125,6 +138,31 @@ Selection precedence:
 5. Capability and live-capacity score for new placement
 
 The capacity score uses declared roles, minimum free-space reserves, free disk, normalized load, available memory, and optional priority. It is a placement heuristic, not a hardware benchmark. Common profiles are `general`, `linux`, `storage`, `macos`, and `services`; custom role names work without source changes. Swift and Xcode projects select `macos` automatically. Set a persistent override with `git config ompup.profile PROFILE`.
+
+## Shared OMP environment
+
+`ompup env sync` treats the local Mac as the declarative source and installs a content-addressed release on each reachable host. Existing remote files are moved into timestamped backups before replacement. The release and every transferred project snapshot are scanned with `gitleaks`.
+
+| Shared and parity-gated | Intentionally machine-local |
+|---|---|
+| OMP version and safe `config.yml` settings | `agent.db`, session history, memories, caches, blobs, logs |
+| Active skills, agents, commands, rules, hooks, and referenced OMP docs | `.env`, broker tokens, API credentials, and other secret files |
+| Portable extensions and exact linked plugin sources | MCP definitions, custom model files, SSH configuration |
+| Auth-broker URL and model-role settings | cmux, Pompup, IRC visualization, and local episodic-memory extensions |
+
+Remote configuration removes local extension paths and disables speech, sonification, and computer control. Skills ignored by the local OMP configuration, large local runtime payloads, and known credential-bearing skill payloads remain local. Authentication uses the OMP auth broker instead of copying SQLite databases or refresh tokens. The bearer token is transferred only through SSH stdin and stored as `~/.omp/auth-broker.token` with mode `0600`.
+
+Initial rollout:
+
+```bash
+ompup auth setup
+ompup auth migrate --dry-run
+ompup auth migrate
+ompup env sync --all
+ompup env status --all
+```
+
+The broker URL should be reachable only through a trusted network such as Tailscale or through TLS. `env sync` skips nothing silently: unreachable hosts and version, fingerprint, plugin, or checksum failures are reported.
 
 ## Environment
 

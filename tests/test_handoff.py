@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,53 @@ class HandoffContractTests(unittest.TestCase):
         self.assertEqual(args.session_file, "/tmp/session.jsonl")
         self.assertEqual(args.session_id, "session-123")
         self.assertTrue(args.prepare_only)
+    def test_environment_parser_targets_multiple_hosts(self) -> None:
+        argv = [
+            "ompup",
+            "env",
+            "sync",
+            "--host",
+            "compute",
+            "--host",
+            "storage",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = CLI.parse_args()
+
+        self.assertEqual(args.command, "env")
+        self.assertEqual(args.env_command, "sync")
+        self.assertEqual(args.host, ["compute", "storage"])
+
+    def test_auth_migrate_parser_preserves_dry_run(self) -> None:
+        with patch.object(sys, "argv", ["ompup", "auth", "migrate", "--dry-run"]):
+            args = CLI.parse_args()
+
+        self.assertEqual(args.command, "auth")
+        self.assertEqual(args.auth_command, "migrate")
+        self.assertTrue(args.dry_run)
+    def test_environment_gate_rejects_unversioned_remote_session(self) -> None:
+        choice = SimpleNamespace(
+            host=SimpleNamespace(name="compute"),
+            probe=SimpleNamespace(session_exists=True),
+        )
+        status = SimpleNamespace(fingerprint="a" * 64)
+        with (
+            patch.object(CLI, "ensure_environment", return_value=status),
+            patch.object(CLI, "session_environment", return_value=""),
+            self.assertRaises(SystemExit),
+        ):
+            CLI.verify_selected_environment(choice, "project")
+
+    def test_attach_records_environment_fingerprint_in_tmux(self) -> None:
+        with patch.object(CLI.os, "execvp") as execvp:
+            CLI.REMOTE = "compute-box"
+            CLI.attach("project", "Projects/project", "omp", "b" * 64)
+
+        remote_command = execvp.call_args.args[1][-1]
+        self.assertIn("@ompup-environment", remote_command)
+        self.assertIn("b" * 64, remote_command)
+
+
 
     def test_cleanup_never_kills_a_session_not_started_by_handoff(self) -> None:
         with patch.object(CLI, "ssh_script") as ssh_script:
