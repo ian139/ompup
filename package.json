@@ -1,6 +1,6 @@
 {
   "name": "ompup",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Jump from any local project directory into a synced Oh My Pi session on your remote box",
   "license": "MIT",
   "repository": {

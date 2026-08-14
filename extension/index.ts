@@ -4,9 +4,9 @@
  * Adds a /ompup slash command so you can push the current project to your
  * remote box without leaving the session:
  *
- *   /ompup sync     rsync this project up (refuses if the remote is dirty)
- *   /ompup pull     bring uncommitted remote work back to this checkout
- *   /ompup status   remote git status + tmux session state
+ *   /ompup sync     safely transfer local uncommitted state to the remote
+ *   /ompup pull     safely transfer remote uncommitted state to this checkout
+ *   /ompup status   compare Git, synchronization, and tmux state
  *
  * The interactive jump (tmux attach + omp launch) stays in the standalone
  * `ompup` CLI; a TUI session cannot hand its terminal to a remote tmux.
@@ -44,7 +44,7 @@ export default function ompup(pi: ExtensionAPI) {
   pi.setLabel("ompup");
 
   pi.registerCommand("ompup", {
-    description: "Sync this project with your remote box (sync|pull|status)",
+    description: "Safely sync this project with your remote box (sync|pull|status)",
     handler: async (args, ctx) => {
       const sub = args.trim() || "status";
       if (!SUBCOMMANDS[sub]) {

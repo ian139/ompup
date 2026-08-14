@@ -2,7 +2,7 @@
 
 Jump from any local project directory into a synced [Oh My Pi](https://github.com/can1357/oh-my-pi) session on your remote box.
 
-One command syncs your working tree to the server, attaches a tmux session named after the project, and launches `omp` inside it. Close your laptop; the session keeps running.
+The first command bootstraps a remote Git checkout, transfers your uncommitted working state, attaches a project-named tmux session, and launches `omp`. Later commands reattach a live session without mutating its checkout. Close your laptop; the session keeps running.
 
 ```
 cd ~/Projects/whatever
@@ -11,23 +11,25 @@ ompup
 
 ## How it works
 
-```
-local checkout ──rsync──> ~/Projects/<name> on your box
-                              │
-                        tmux new -A -s <name>
-                              │
-                             omp
+```text
+local Git history ──bundle, first run only──> ~/Projects/<name>
+local working tree ──verified snapshot──────>        │
+                                                     │
+                                               tmux new -A
+                                                     │
+                                                    omp
 ```
 
-- Git stays canonical. Commit and push from either side; rsync only carries uncommitted working state so you can jump mid-thought.
-- Secrets never sync: `.env*`, `*.pem`, `*.key` are always excluded, along with `node_modules`, virtualenvs, and build output.
-- Up-sync uses `--delete` for a faithful mirror, so a dirty-remote guard refuses to sync when the remote checkout has uncommitted changes. Commit there or run `ompup pull` first.
-- The tmux session survives disconnects. Running `ompup` again reattaches instead of creating a duplicate.
+- Git transports commits and refs. ompup never rsyncs one live `.git` directory over another.
+- A temporary Git index captures tracked files plus untracked, non-ignored files. Dependency directories, build output, ignored files, and sensitive paths stay out of the snapshot.
+- Every successful transfer records the exact Git HEAD and snapshot tree. A later transfer proceeds only when the destination still matches that baseline. Conflicting edits, different commits, and repository-name collisions fail visibly.
+- The first transfer scans reachable history and every transfer scans its working snapshot with `gitleaks`.
+- An existing tmux session is reattached without synchronizing files beneath the running process. Use `ompup sync` explicitly when you want a later local change transferred.
 
 ## Requirements
 
-- Local: `ssh`, `rsync`, `git`
-- Remote: `tmux`, `rsync`, `git`, and `omp` on `PATH`
+- Local: Python 3.9 or newer, `ssh`, `rsync`, `git`, and `gitleaks`
+- Remote: Bash, `tmux`, `rsync`, `git`, and `omp` on `PATH`
 - An SSH host or alias that reaches your box (an entry in `~/.ssh/config` works well)
 
 ## Install
@@ -58,11 +60,11 @@ omp --extension ./ompup/extension/index.ts
 
 | Command | Effect |
 |---|---|
-| `ompup` | Sync up, attach tmux, launch omp (reattach if the session exists) |
-| `ompup sync` | Sync up only, no attach |
-| `ompup pull` | Sync remote work back to the local checkout (never deletes local files) |
-| `ompup status` | Remote git status and tmux session state |
-| `ompup shell` | Sync up and attach a plain shell instead of omp |
+| `ompup` | Bootstrap or sync when no session exists, then attach tmux and launch omp; a live session is attached without changing files |
+| `ompup sync` | Safely transfer local uncommitted state, no attach |
+| `ompup pull` | Safely transfer remote uncommitted state to an unchanged local baseline |
+| `ompup status` | Compare local and remote Git, synchronization, and tmux state |
+| `ompup shell` | Bootstrap or sync when needed, then attach a plain shell |
 
 ## Configuration
 
@@ -71,13 +73,14 @@ omp --extension ./ompup/extension/index.ts
 | `OMPUP_HOST` | required | SSH host or alias for the remote box |
 | `OMPUP_REMOTE_ROOT` | `Projects` | Directory under the remote `$HOME` that holds project checkouts |
 | `OMPUP_CMD` | `omp` | Command launched inside the tmux session |
-| `OMPUP_EXCLUDES` | empty | Extra colon-separated rsync exclude patterns |
+| `OMPUP_EXCLUDES` | unsupported | Use `.gitignore` or `.git/info/exclude` so the synchronization snapshot remains verifiable |
 
 ## Notes
 
-- The project name comes from the git toplevel directory (or the current directory outside a repo) and doubles as the tmux session name.
+- Run ompup inside a Git repository. The repository directory name also becomes the tmux session name.
 - Quitting omp drops to a shell inside the session instead of killing it.
-- `ompup pull` intentionally skips `--delete`; review the result with `git status` before committing.
+- Committed changes move through normal Git push, fetch, or pull operations. ompup handles only uncommitted working state after bootstrap.
+- `ompup pull` may delete local paths to reproduce the remote snapshot, but only when the local checkout exactly matches the recorded baseline.
 
 ## License
 

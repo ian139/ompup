@@ -1,116 +1,547 @@
-#!/usr/bin/env bash
-# ompup - jump from any local project directory into a synced omp session
-# on your remote box: rsync the working tree up, attach a tmux session named
-# after the project, and launch omp inside it.
-#
-#   ompup              sync local -> remote, attach tmux, run omp
-#   ompup sync         sync only, no attach (used by the omp extension)
-#   ompup pull         sync remote -> local (no --delete; brings work home)
-#   ompup status       remote git status + tmux session state
-#   ompup shell        sync and attach a plain shell instead of omp
-#
-# Git stays canonical: commit and push from either side. rsync only carries
-# uncommitted working state so you can jump mid-thought. Secrets (.env*,
-# keys) and dependency/build directories never sync.
-#
-# Configuration (environment):
-#   OMPUP_HOST         SSH host or alias for the remote box (required)
-#   OMPUP_REMOTE_ROOT  remote directory under $HOME for projects
-#                      (default: Projects)
-#   OMPUP_CMD          command launched inside tmux (default: omp)
-#   OMPUP_EXCLUDES     extra colon-separated rsync exclude patterns
+#!/usr/bin/env python3
+"""Safely enter a project-specific OMP session on a remote development box.
+
+Git history is bundled only when a remote checkout is first created; later
+committed-history changes travel through Git. Uncommitted working state is
+synchronized as a Git tree snapshot, guarded by the exact HEAD and tree
+recorded after the last successful transfer.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+VERSION = "0.2.0"
+HOST = os.environ.get("OMPUP_HOST", "")
+REMOTE_ROOT = os.environ.get("OMPUP_REMOTE_ROOT", "Projects").strip("/")
+LAUNCH = os.environ.get("OMPUP_CMD", "omp")
+REMOTE = HOST
+PRESERVED_DIRS = {
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+}
+SENSITIVE_NAMES = {".env", ".envrc", ".npmrc", ".pypirc"}
+
+REMOTE_STATE_SCRIPT = r"""
 set -euo pipefail
+repo="$HOME/$1"
+git_dir=$(git -C "$repo" rev-parse --absolute-git-dir)
+idx=$(mktemp)
+rm -f "$idx"
+trap 'rm -f "$idx"' EXIT
+if [ -f "$git_dir/index" ]; then cp "$git_dir/index" "$idx"; fi
+GIT_INDEX_FILE="$idx" git -C "$repo" add -A -- . >/dev/null
+head=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')
+tree=$(GIT_INDEX_FILE="$idx" git -C "$repo" write-tree)
+printf '%s:%s\n' "$head" "$tree"
+"""
 
-VERSION="0.1.0"
+READ_BASELINE_SCRIPT = r"""
+set -euo pipefail
+path="$HOME/.local/state/ompup/$1.state"
+[ -f "$path" ] || exit 3
+cat "$path"
+"""
 
-die() { printf 'ompup: %s\n' "$*" >&2; exit 1; }
+WRITE_BASELINE_SCRIPT = r"""
+set -euo pipefail
+umask 077
+dir="$HOME/.local/state/ompup"
+mkdir -p "$dir"
+tmp=$(mktemp "$dir/.state.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+printf '%s\n%s\n' "$2" "$3" > "$tmp"
+mv "$tmp" "$dir/$1.state"
+trap - EXIT
+"""
 
-HOST="${OMPUP_HOST:-}"
-[ -n "$HOST" ] || die "set OMPUP_HOST to your remote SSH host or alias"
-REMOTE_ROOT="${OMPUP_REMOTE_ROOT:-Projects}"
-LAUNCH="${OMPUP_CMD:-omp}"
-
-root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-proj="$(basename "$root")"
-[[ "$proj" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "project name '$proj' is not safe for remote paths"
-remote_dir="$REMOTE_ROOT/$proj"   # relative to remote $HOME
-session="$(printf '%s' "$proj" | tr '[:upper:] ' '[:lower:]-' | tr -cd '[:alnum:]_.:-')"
-
-EXCLUDES=(
-  --exclude '.env' --exclude '.env.*' --exclude '*.pem' --exclude '*.key'
-  --exclude 'node_modules/' --exclude '.venv/' --exclude 'venv/'
-  --exclude '__pycache__/' --exclude '.pytest_cache/' --exclude '.mypy_cache/'
-  --exclude 'target/' --exclude 'dist/' --exclude 'build/' --exclude '.next/'
-  --exclude '.turbo/' --exclude '.cache/' --exclude '.DS_Store'
-)
-if [ -n "${OMPUP_EXCLUDES:-}" ]; then
-  IFS=':' read -ra extra <<< "$OMPUP_EXCLUDES"
-  for pat in "${extra[@]}"; do
-    [ -n "$pat" ] && EXCLUDES+=(--exclude "$pat")
-  done
+BOOTSTRAP_SCRIPT = r"""
+set -euo pipefail
+target="$HOME/$1"
+bundle="$2"
+branch="$3"
+origin="$4"
+[ ! -e "$target" ] || { echo 'remote project path already exists' >&2; exit 4; }
+mkdir -p "$(dirname "$target")"
+cleanup() { rm -rf "$target"; [ -z "$bundle" ] || rm -f "$HOME/$bundle"; }
+trap cleanup ERR INT TERM
+if [ -n "$bundle" ]; then
+  git clone -q --branch "$branch" "$HOME/$bundle" "$target"
+  git -C "$target" remote remove origin
+  rm -f "$HOME/$bundle"
+else
+  git init -q -b "$branch" "$target"
 fi
+if [ -n "$origin" ]; then git -C "$target" remote add origin "$origin"; fi
+trap - ERR INT TERM
+"""
 
-remote_exists() { ssh "$HOST" "test -d '$remote_dir'"; }
-remote_dirty()  { ssh "$HOST" "git -C '$remote_dir' status --porcelain 2>/dev/null" | grep -q .; }
+ARCHIVE_SCRIPT = r"""
+set -euo pipefail
+exec git -C "$HOME/$1" archive --format=tar "$2"
+"""
 
-sync_up() {
-  if remote_exists && remote_dirty; then
-    # Never clobber work done on the box; up-sync uses --delete.
-    printf 'ompup: remote %s has uncommitted changes.\n' "$HOST:~/$remote_dir" >&2
-    printf 'ompup: commit and push there, or run `ompup pull` first. Skipping sync.\n' >&2
-    return 1
-  fi
-  ssh "$HOST" "mkdir -p '$remote_dir'"
-  rsync -az --delete "${EXCLUDES[@]}" "$root/" "$HOST:$remote_dir/"
-}
 
-attach() {
-  local launch="$1"
-  # -A: attach if the session exists, create otherwise. On create, land in
-  # the project directory; fall back to a shell so quitting doesn't kill
-  # the session.
-  if [ -n "$launch" ]; then
-    exec ssh -t "$HOST" "tmux new-session -A -s '$session' -c \"\$HOME/$remote_dir\" '$launch; exec \$SHELL'"
-  else
-    exec ssh -t "$HOST" "tmux new-session -A -s '$session' -c \"\$HOME/$remote_dir\""
-  fi
-}
+def die(message: str) -> "NoReturn":
+    print(f"ompup: {message}", file=sys.stderr)
+    raise SystemExit(1)
 
-cmd="${1:-up}"
-case "$cmd" in
-  up)
-    sync_up || true
-    attach "$LAUNCH"
-    ;;
-  shell)
-    sync_up || true
-    attach ""
-    ;;
-  sync)
-    sync_up
-    printf 'ompup: synced %s -> %s\n' "$root" "$HOST:~/$remote_dir"
-    ;;
-  pull)
-    remote_exists || die "nothing at $HOST:~/$remote_dir"
-    # No --delete: pull merges remote work onto local; git shows the diff.
-    rsync -az "${EXCLUDES[@]}" "$HOST:$remote_dir/" "$root/"
-    git -C "$root" status --short 2>/dev/null || true
-    ;;
-  status)
-    ssh "$HOST" "
-      echo '== git (~/$remote_dir)';
-      git -C '$remote_dir' status --short --branch 2>/dev/null || echo '(no remote checkout)';
-      echo '== tmux';
-      tmux list-sessions 2>/dev/null | grep '^$session:' || echo '(no session $session)'
-    "
-    ;;
-  version|--version)
-    printf 'ompup %s\n' "$VERSION"
-    ;;
-  -h|--help|help)
-    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
-    ;;
-  *)
-    die "unknown command '$cmd' (up|sync|pull|status|shell; default up)"
-    ;;
-esac
+
+def run(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    capture: bool = False,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args,
+        cwd=cwd,
+        env=env,
+        check=check,
+        capture_output=capture,
+        text=text,
+    )
+
+
+def ssh_command(command: str, *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    return run(["ssh", REMOTE, command], check=check, capture=capture)
+
+
+def ssh_script(
+    script: str,
+    *args: str,
+    check: bool = True,
+    capture: bool = False,
+) -> subprocess.CompletedProcess:
+    command = "bash -s -- " + " ".join(shlex.quote(arg) for arg in args)
+    return subprocess.run(
+        ["ssh", REMOTE, command],
+        input=script,
+        text=True,
+        check=check,
+        capture_output=capture,
+    )
+
+
+def git(root: Path, *args: str, env: dict[str, str] | None = None, capture: bool = True) -> str:
+    result = run(["git", "-C", str(root), *args], env=env, capture=capture)
+    return result.stdout.strip() if capture else ""
+
+
+def project_root() -> Path:
+    result = run(["git", "rev-parse", "--show-toplevel"], check=False, capture=True)
+    if result.returncode != 0:
+        die("run from inside a Git repository")
+    return Path(result.stdout.strip()).resolve()
+
+
+def project_identity(root: Path) -> tuple[str, str]:
+    result = run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        check=False,
+        capture=True,
+    )
+    origin = result.stdout.strip() if result.returncode == 0 else ""
+    material = f"origin\0{origin}" if origin else f"path\0{root}"
+    identity = hashlib.sha256(material.encode()).hexdigest()
+
+    # Never copy credential-bearing or machine-local origins to the remote box.
+    remote_origin = origin
+    if re.match(r"https?://[^/@]+@", origin) or (origin and origin.startswith(("/", "file:"))):
+        remote_origin = ""
+    return identity, remote_origin
+
+
+def prepare_index(root: Path) -> tuple[Path, str, list[str]]:
+    git_dir = Path(git(root, "rev-parse", "--absolute-git-dir"))
+    handle = tempfile.NamedTemporaryFile(prefix="ompup-index-", delete=False)
+    index = Path(handle.name)
+    handle.close()
+    index.unlink()
+    if (git_dir / "index").is_file():
+        shutil.copy2(git_dir / "index", index)
+
+    env = os.environ.copy()
+    env["GIT_INDEX_FILE"] = str(index)
+    try:
+        git(root, "add", "-A", "--", ".", env=env, capture=False)
+        tree = git(root, "write-tree", env=env)
+        entries = git(root, "ls-files", "-z", env=env).split("\0")
+    except Exception:
+        index.unlink(missing_ok=True)
+        raise
+    return index, tree, [entry for entry in entries if entry]
+
+
+def repository_head(root: Path) -> str:
+    result = run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+        check=False,
+        capture=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "0" * 40
+
+
+def local_state(root: Path) -> str:
+    index, tree, _ = prepare_index(root)
+    index.unlink(missing_ok=True)
+    return f"{repository_head(root)}:{tree}"
+
+
+def remote_exists(remote_dir: str) -> bool:
+    command = f"test -d {shlex.quote(remote_dir)}"
+    return ssh_command(command, check=False).returncode == 0
+
+
+def remote_state(remote_dir: str) -> str:
+    result = ssh_script(REMOTE_STATE_SCRIPT, remote_dir, capture=True)
+    return result.stdout.strip()
+
+
+def session_exists(session: str) -> bool:
+    result = ssh_script('tmux has-session -t "=$1" 2>/dev/null', session, check=False)
+    return result.returncode == 0
+
+
+def read_baseline(state_key: str) -> tuple[str, str] | None:
+    result = ssh_script(READ_BASELINE_SCRIPT, state_key, check=False, capture=True)
+    if result.returncode == 3:
+        return None
+    if result.returncode != 0:
+        die("could not read remote synchronization state")
+    lines = result.stdout.splitlines()
+    if len(lines) != 2 or not re.fullmatch(r"[0-9a-f]{64}", lines[0]):
+        die("remote synchronization state is malformed")
+    return lines[0], lines[1]
+
+
+def write_baseline(state_key: str, identity: str, state: str) -> None:
+    ssh_script(WRITE_BASELINE_SCRIPT, state_key, identity, state)
+
+
+def validate_snapshot_paths(entries: list[str]) -> None:
+    for entry in entries:
+        path = Path(entry)
+        if any(part in PRESERVED_DIRS for part in path.parts):
+            die(f"unignored dependency/build path would transfer: {entry}")
+        name = path.name
+        if name in SENSITIVE_NAMES or name.startswith(".env.") or name.endswith((".pem", ".key")):
+            die(f"sensitive path requires explicit handling and will not transfer: {entry}")
+
+
+def scan_snapshot(path: Path) -> None:
+    result = run(
+        ["gitleaks", "dir", "--no-banner", "--redact", "--log-level", "error", str(path)],
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        die("secret scan rejected the working snapshot; review it locally with gitleaks")
+
+
+def scan_history(root: Path) -> None:
+    result = run(
+        ["gitleaks", "git", "--no-banner", "--redact", "--log-level", "error", str(root)],
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        die("secret scan rejected reachable Git history; review it locally with gitleaks")
+
+
+def make_local_stage(root: Path, stage: Path) -> str:
+    index, tree, entries = prepare_index(root)
+    try:
+        validate_snapshot_paths(entries)
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = str(index)
+        prefix = str(stage) + os.sep
+        git(root, "checkout-index", "--all", "--force", f"--prefix={prefix}", env=env, capture=False)
+    finally:
+        index.unlink(missing_ok=True)
+    scan_snapshot(stage)
+    return f"{repository_head(root)}:{tree}"
+
+
+def rsync_stage(stage: Path, destination: str) -> None:
+    args = ["rsync", "-a", "--delete", "--exclude", ".git/"]
+    for directory in sorted(PRESERVED_DIRS):
+        args.extend(["--exclude", f"{directory}/"])
+    args.extend([str(stage) + os.sep, destination])
+    run(args)
+
+
+def bootstrap(
+    root: Path,
+    project: str,
+    state_key: str,
+    remote_dir: str,
+    identity: str,
+    origin: str,
+) -> str:
+    branch = git(root, "symbolic-ref", "--short", "HEAD")
+    with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name, tempfile.TemporaryDirectory(
+        prefix="ompup-bundle-"
+    ) as bundle_dir:
+        stage = Path(stage_name)
+        expected = make_local_stage(root, stage)
+        head = expected.split(":", 1)[0]
+        remote_bundle = ""
+        if head != "0" * 40:
+            scan_history(root)
+            bundle = Path(bundle_dir) / f"{project}.bundle"
+            git(root, "bundle", "create", str(bundle), f"refs/heads/{branch}", capture=False)
+            remote_bundle = f".cache/ompup/{project}.{os.getpid()}.bundle"
+            ssh_command("mkdir -p ~/.cache/ompup")
+            run(["rsync", "-a", str(bundle), f"{REMOTE}:{remote_bundle}"])
+        ssh_script(BOOTSTRAP_SCRIPT, remote_dir, remote_bundle, branch, origin)
+        rsync_stage(stage, f"{REMOTE}:{remote_dir}/")
+
+    actual = remote_state(remote_dir)
+    if actual != expected:
+        die("remote checkout did not match the prepared snapshot; synchronization state was not recorded")
+    write_baseline(state_key, identity, actual)
+    print(f"ompup: bootstrapped {REMOTE}:~/{remote_dir}")
+    return actual
+
+
+def assert_identity(state_key: str, remote_dir: str, identity: str, local: str, remote: str) -> str:
+    baseline = read_baseline(state_key)
+    if baseline is None:
+        if local != remote:
+            die("existing remote checkout predates safe sync and differs locally; reconcile it with Git first")
+        write_baseline(state_key, identity, remote)
+        return remote
+    recorded_identity, recorded_state = baseline
+    if recorded_identity != identity:
+        die(f"~/{remote_dir} maps to a different local repository; choose a distinct project name")
+    return recorded_state
+
+
+def sync_up(
+    root: Path,
+    project: str,
+    state_key: str,
+    remote_dir: str,
+    identity: str,
+    origin: str,
+) -> None:
+    local = local_state(root)
+    if not remote_exists(remote_dir):
+        bootstrap(root, project, state_key, remote_dir, identity, origin)
+        return
+
+    remote = remote_state(remote_dir)
+    baseline = assert_identity(state_key, remote_dir, identity, local, remote)
+    if local == remote:
+        write_baseline(state_key, identity, remote)
+        print("ompup: local and remote snapshots already match")
+        return
+    if local.split(":", 1)[0] != remote.split(":", 1)[0]:
+        die("local and remote commits differ; synchronize commits with Git before transferring working state")
+    if remote != baseline:
+        die("remote working state changed since the last sync; run `ompup pull` or resolve the conflict")
+
+    with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name:
+        expected = make_local_stage(root, Path(stage_name))
+        if expected != local:
+            die("local checkout changed while its snapshot was being prepared; retry")
+        rsync_stage(Path(stage_name), f"{REMOTE}:{remote_dir}/")
+
+    actual = remote_state(remote_dir)
+    if actual != local:
+        die("remote verification did not match the local snapshot; synchronization state was not advanced")
+    write_baseline(state_key, identity, actual)
+    print("ompup: synchronized local working state to remote")
+
+
+def download_remote_stage(remote_dir: str, tree: str, stage: Path) -> None:
+    command = "bash -s -- " + " ".join(shlex.quote(value) for value in (remote_dir, tree))
+    with tempfile.NamedTemporaryFile(prefix="ompup-archive-", suffix=".tar") as archive:
+        process = subprocess.Popen(
+            ["ssh", REMOTE, command],
+            stdin=subprocess.PIPE,
+            stdout=archive,
+            stderr=subprocess.PIPE,
+        )
+        _, stderr = process.communicate(ARCHIVE_SCRIPT.encode())
+        if process.returncode != 0:
+            die(f"could not archive remote working state: {stderr.decode(errors='replace').strip()}")
+        archive.flush()
+        archive.seek(0)
+        with tarfile.open(fileobj=archive, mode="r:") as tar:
+            for member in tar.getmembers():
+                target = (stage / member.name).resolve()
+                if not target.is_relative_to(stage.resolve()):
+                    die("remote archive contains an unsafe path")
+            tar.extractall(stage, filter="data")
+    scan_snapshot(stage)
+
+
+def sync_down(root: Path, state_key: str, remote_dir: str, identity: str) -> None:
+    if not remote_exists(remote_dir):
+        die(f"nothing at {REMOTE}:~/{remote_dir}")
+    local = local_state(root)
+    remote = remote_state(remote_dir)
+    baseline = assert_identity(state_key, remote_dir, identity, local, remote)
+    if local == remote:
+        write_baseline(state_key, identity, remote)
+        print("ompup: local and remote snapshots already match")
+        return
+    if local.split(":", 1)[0] != remote.split(":", 1)[0]:
+        die("local and remote commits differ; synchronize commits with Git before transferring working state")
+    if local != baseline:
+        if remote == baseline:
+            die("remote has no changes to download; local working state changed")
+        die("both local and remote working states changed since the last sync; resolve the conflict")
+
+    tree = remote.split(":", 1)[1]
+    with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name:
+        stage = Path(stage_name)
+        download_remote_stage(remote_dir, tree, stage)
+        rsync_stage(stage, str(root) + os.sep)
+
+    actual = local_state(root)
+    if actual != remote:
+        die("local verification did not match the remote snapshot; synchronization state was not advanced")
+    write_baseline(state_key, identity, actual)
+    print("ompup: synchronized remote working state to local")
+    run(["git", "-C", str(root), "status", "--short"], check=False)
+
+
+def show_status(
+    root: Path,
+    state_key: str,
+    remote_dir: str,
+    identity: str,
+    session: str,
+) -> None:
+    local = local_state(root)
+    print(f"== local ({root})")
+    run(["git", "-C", str(root), "status", "--short", "--branch"], check=False)
+    if not remote_exists(remote_dir):
+        print(f"== remote ({REMOTE}:~/{remote_dir})\n(no checkout)\n== tmux\n(no session {session})")
+        return
+    remote = remote_state(remote_dir)
+    baseline_data = read_baseline(state_key)
+    print(f"== remote ({REMOTE}:~/{remote_dir})")
+    ssh_command(f"git -C {shlex.quote(remote_dir)} status --short --branch", check=False)
+    print("== sync")
+    if baseline_data is None:
+        print("unregistered existing checkout")
+    elif baseline_data[0] != identity:
+        print("project identity mismatch")
+    elif local == remote:
+        print("local and remote match")
+    elif local.split(":", 1)[0] != remote.split(":", 1)[0]:
+        print("commits differ; synchronize with Git before transferring working state")
+    elif local == baseline_data[1]:
+        print("remote changed; `ompup pull` is safe")
+    elif remote == baseline_data[1]:
+        print("local changed; `ompup sync` is safe")
+    else:
+        print("both sides changed; manual resolution required")
+    print("== tmux")
+    print(f"session {session} is {'running' if session_exists(session) else 'not running'}")
+
+
+def usage() -> None:
+    print(
+        """Usage:
+  ompup              bootstrap/sync if needed, attach tmux, launch OMP
+  ompup sync         safely sync local working state, no attach
+  ompup pull         safely sync remote working state to local
+  ompup status       compare Git, sync, and tmux state
+  ompup shell        bootstrap/sync if needed, attach a remote shell
+
+An existing tmux session is attached without changing its checkout. Committed
+changes move through Git. ompup transports uncommitted, non-ignored files only
+when the other side still matches the recorded synchronization baseline."""
+    )
+
+
+def attach(session: str, remote_dir: str, launch: str) -> None:
+    command = (
+        f"tmux new-session -A -s {shlex.quote(session)} "
+        f'-c \"$HOME/{remote_dir}\"'
+    )
+    if launch:
+        command += " " + shlex.quote(f'{launch}; exec \"$SHELL\"')
+    os.execvp("ssh", ["ssh", "-t", REMOTE, command])
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    command = argv.pop(0) if argv else "up"
+    if command in {"help", "-h", "--help"}:
+        usage()
+        return
+    if command in {"version", "--version"}:
+        print(f"ompup {VERSION}")
+        return
+    if command not in {"up", "sync", "pull", "status", "shell"}:
+        die(f"unknown command {command!r}; use up, sync, pull, status, or shell")
+    if argv:
+        die(f"{command} takes no additional arguments")
+    if not HOST:
+        die("set OMPUP_HOST to your remote SSH host or alias")
+    if not REMOTE_ROOT or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", REMOTE_ROOT):
+        die("OMPUP_REMOTE_ROOT must be a relative path of safe directory names")
+    if any(part in {".", ".."} for part in REMOTE_ROOT.split("/")):
+        die("OMPUP_REMOTE_ROOT cannot contain . or ..")
+    if os.environ.get("OMPUP_EXCLUDES"):
+        die("OMPUP_EXCLUDES is no longer supported; use .gitignore or .git/info/exclude")
+    for executable in ("git", "ssh", "rsync", "gitleaks"):
+        if shutil.which(executable) is None:
+            die(f"required local command not found: {executable}")
+
+    root = project_root()
+    project = root.name
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", project):
+        die(f"project name {project!r} is not safe for remote paths")
+    remote_dir = f"{REMOTE_ROOT}/{project}"
+    state_key = f"{hashlib.sha256(remote_dir.encode()).hexdigest()[:16]}-{project}"
+    session = re.sub(r"[^a-z0-9_.:-]", "", project.lower().replace(" ", "-"))
+    identity, origin = project_identity(root)
+
+    if command == "status":
+        show_status(root, state_key, remote_dir, identity, session)
+        return
+    if command == "pull":
+        sync_down(root, state_key, remote_dir, identity)
+        return
+    if command == "sync":
+        sync_up(root, project, state_key, remote_dir, identity, origin)
+        return
+
+    if remote_exists(remote_dir) and session_exists(session):
+        print("ompup: existing tmux session found; attaching without changing its checkout")
+    else:
+        sync_up(root, project, state_key, remote_dir, identity, origin)
+    attach(session, remote_dir, "" if command == "shell" else LAUNCH)
+
+
+if __name__ == "__main__":
+    main()
