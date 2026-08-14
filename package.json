@@ -1,7 +1,7 @@
 {
   "name": "ompup",
-  "version": "0.2.0",
-  "description": "Jump from any local project directory into a synced Oh My Pi session on your remote box",
+  "version": "0.3.0",
+  "description": "Continue local Oh My Pi projects on the best available persistent remote machine",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -10,8 +10,11 @@
   "bin": {
     "ompup": "./bin/ompup"
   },
+  "scripts": {
+    "test": "python3 -m unittest -v tests/test_hosts.py"
+  },
   "omp": {
     "extensions": ["./extension/index.ts"]
   },
-  "keywords": ["oh-my-pi", "omp", "tmux", "ssh", "rsync", "remote-development"]
+  "keywords": ["oh-my-pi", "omp", "tmux", "ssh", "rsync", "remote-development", "multi-host", "cmux"]
 }

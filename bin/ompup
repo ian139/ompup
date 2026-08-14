@@ -9,7 +9,10 @@ recorded after the last successful transfer.
 
 from __future__ import annotations
 
+import argparse
+
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -20,11 +23,30 @@ import sys
 import tarfile
 import tempfile
 
-VERSION = "0.2.0"
-HOST = os.environ.get("OMPUP_HOST", "")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from ompup.hosts import (  # noqa: E402
+    HostChoice,
+    HostProbe,
+    HostSelectionError,
+    choose_host,
+    find_host,
+    format_probe,
+    load_hosts,
+    pin_host,
+    pinned_host,
+    probe_hosts,
+    project_profile,
+    resolve_project,
+    unpin_host,
+)
+
+VERSION = "0.3.0"
+LEGACY_HOST = os.environ.get("OMPUP_HOST", "")
 REMOTE_ROOT = os.environ.get("OMPUP_REMOTE_ROOT", "Projects").strip("/")
-LAUNCH = os.environ.get("OMPUP_CMD", "omp")
-REMOTE = HOST
+LAUNCH_OVERRIDE = os.environ.get("OMPUP_CMD", "")
+LAUNCH = ""
+REMOTE = ""
 PRESERVED_DIRS = {
     "node_modules",
     ".venv",
@@ -100,6 +122,36 @@ set -euo pipefail
 exec git -C "$HOME/$1" archive --format=tar "$2"
 """
 
+FAST_FORWARD_REMOTE_SCRIPT = r"""
+set -euo pipefail
+repo="$HOME/$1"
+bundle="$HOME/$2"
+branch="$3"
+cleanup() { rm -f "$bundle"; }
+trap cleanup EXIT
+current_branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD)
+if [ "$current_branch" != "$branch" ]; then
+  printf 'branch mismatch: remote=%s local=%s\n' "$current_branch" "$branch" >&2
+  exit 6
+fi
+git -C "$repo" fetch -q "$bundle" "refs/heads/$branch"
+incoming=$(git -C "$repo" rev-parse FETCH_HEAD)
+current=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || true)
+if [ -n "$current" ]; then
+  git -C "$repo" merge-base --is-ancestor "$current" "$incoming"
+fi
+git -C "$repo" reset --hard -q "$incoming"
+"""
+
+CREATE_REMOTE_BUNDLE_SCRIPT = r"""
+set -euo pipefail
+repo="$HOME/$1"
+bundle="$HOME/$2"
+branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD)
+git -C "$repo" bundle create "$bundle" "refs/heads/$branch" >/dev/null
+printf '%s\n' "$branch"
+"""
+
 
 def die(message: str) -> "NoReturn":
     print(f"ompup: {message}", file=sys.stderr)
@@ -150,11 +202,6 @@ def git(root: Path, *args: str, env: dict[str, str] | None = None, capture: bool
     return result.stdout.strip() if capture else ""
 
 
-def project_root() -> Path:
-    result = run(["git", "rev-parse", "--show-toplevel"], check=False, capture=True)
-    if result.returncode != 0:
-        die("run from inside a Git repository")
-    return Path(result.stdout.strip()).resolve()
 
 
 def project_identity(root: Path) -> tuple[str, str]:
@@ -326,6 +373,83 @@ def bootstrap(
     print(f"ompup: bootstrapped {REMOTE}:~/{remote_dir}")
     return actual
 
+def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    if ancestor == "0" * 40:
+        return True
+    result = run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant],
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def fast_forward_remote(root: Path, project: str, remote_dir: str, remote_head: str) -> None:
+    local_head = repository_head(root)
+    if not is_ancestor(root, remote_head, local_head):
+        die("local commit history is not a fast-forward of the remote; reconcile it with Git")
+    branch = git(root, "symbolic-ref", "--short", "HEAD")
+    scan_history(root)
+    with tempfile.TemporaryDirectory(prefix="ompup-commit-bundle-") as bundle_dir:
+        bundle = Path(bundle_dir) / f"{project}.bundle"
+        git(root, "bundle", "create", str(bundle), f"refs/heads/{branch}", capture=False)
+        remote_bundle = f".cache/ompup/{project}.{os.getpid()}.ff.bundle"
+        ssh_command("mkdir -p ~/.cache/ompup")
+        run(["rsync", "-a", str(bundle), f"{REMOTE}:{remote_bundle}"])
+        result = ssh_script(
+            FAST_FORWARD_REMOTE_SCRIPT,
+            remote_dir,
+            remote_bundle,
+            branch,
+            check=False,
+            capture=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "remote Git rejected the update"
+            die(f"could not fast-forward remote commits: {detail}")
+    print(f"ompup: fast-forwarded remote commits to {local_head[:10]}")
+
+
+def fast_forward_local(root: Path, project: str, remote_dir: str, remote_head: str) -> None:
+    local_head = repository_head(root)
+    remote_bundle = f".cache/ompup/{project}.{os.getpid()}.pull.bundle"
+    ssh_command("mkdir -p ~/.cache/ompup")
+    result = ssh_script(
+        CREATE_REMOTE_BUNDLE_SCRIPT,
+        remote_dir,
+        remote_bundle,
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        die("could not create a Git bundle from the remote branch")
+    branch = result.stdout.strip()
+    local_branch = run(
+        ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        check=False,
+        capture=True,
+    )
+    if local_branch.returncode != 0 or local_branch.stdout.strip() != branch:
+        ssh_command(f"rm -f {shlex.quote(remote_bundle)}", check=False)
+        die(f"branch mismatch: local={local_branch.stdout.strip() or 'detached'} remote={branch}")
+    with tempfile.TemporaryDirectory(prefix="ompup-pull-bundle-") as bundle_dir:
+        bundle = Path(bundle_dir) / f"{project}.bundle"
+        try:
+            run(["rsync", "-a", f"{REMOTE}:{remote_bundle}", str(bundle)])
+        finally:
+            ssh_command(f"rm -f {shlex.quote(remote_bundle)}", check=False)
+        git(root, "fetch", "-q", str(bundle), f"refs/heads/{branch}")
+        incoming = git(root, "rev-parse", "FETCH_HEAD")
+        if incoming != remote_head or not is_ancestor(root, local_head, incoming):
+            die("remote commit history is not a fast-forward of local; reconcile it with Git")
+        temp_ref = "refs/ompup/incoming"
+        git(root, "update-ref", temp_ref, incoming, capture=False)
+        try:
+            scan_history(root)
+        finally:
+            git(root, "update-ref", "-d", temp_ref, capture=False)
+        git(root, "reset", "--hard", "-q", incoming, capture=False)
+    print(f"ompup: fast-forwarded local commits to {incoming[:10]}")
+
 
 def assert_identity(state_key: str, remote_dir: str, identity: str, local: str, remote: str) -> str:
     baseline = read_baseline(state_key)
@@ -359,10 +483,11 @@ def sync_up(
         write_baseline(state_key, identity, remote)
         print("ompup: local and remote snapshots already match")
         return
-    if local.split(":", 1)[0] != remote.split(":", 1)[0]:
-        die("local and remote commits differ; synchronize commits with Git before transferring working state")
     if remote != baseline:
         die("remote working state changed since the last sync; run `ompup pull` or resolve the conflict")
+    local_head, remote_head = local.split(":", 1)[0], remote.split(":", 1)[0]
+    if local_head != remote_head:
+        fast_forward_remote(root, project, remote_dir, remote_head)
 
     with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name:
         expected = make_local_stage(root, Path(stage_name))
@@ -400,7 +525,7 @@ def download_remote_stage(remote_dir: str, tree: str, stage: Path) -> None:
     scan_snapshot(stage)
 
 
-def sync_down(root: Path, state_key: str, remote_dir: str, identity: str) -> None:
+def sync_down(root: Path, project: str, state_key: str, remote_dir: str, identity: str) -> None:
     if not remote_exists(remote_dir):
         die(f"nothing at {REMOTE}:~/{remote_dir}")
     local = local_state(root)
@@ -410,12 +535,13 @@ def sync_down(root: Path, state_key: str, remote_dir: str, identity: str) -> Non
         write_baseline(state_key, identity, remote)
         print("ompup: local and remote snapshots already match")
         return
-    if local.split(":", 1)[0] != remote.split(":", 1)[0]:
-        die("local and remote commits differ; synchronize commits with Git before transferring working state")
     if local != baseline:
         if remote == baseline:
             die("remote has no changes to download; local working state changed")
         die("both local and remote working states changed since the last sync; resolve the conflict")
+    local_head, remote_head = local.split(":", 1)[0], remote.split(":", 1)[0]
+    if local_head != remote_head:
+        fast_forward_local(root, project, remote_dir, remote_head)
 
     tree = remote.split(":", 1)[1]
     with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name:
@@ -467,21 +593,6 @@ def show_status(
     print(f"session {session} is {'running' if session_exists(session) else 'not running'}")
 
 
-def usage() -> None:
-    print(
-        """Usage:
-  ompup              bootstrap/sync if needed, attach tmux, launch OMP
-  ompup sync         safely sync local working state, no attach
-  ompup pull         safely sync remote working state to local
-  ompup status       compare Git, sync, and tmux state
-  ompup shell        bootstrap/sync if needed, attach a remote shell
-
-An existing tmux session is attached without changing its checkout. Committed
-changes move through Git. ompup transports uncommitted, non-ignored files only
-when the other side still matches the recorded synchronization baseline."""
-    )
-
-
 def attach(session: str, remote_dir: str, launch: str) -> None:
     command = (
         f"tmux new-session -A -s {shlex.quote(session)} "
@@ -492,21 +603,59 @@ def attach(session: str, remote_dir: str, launch: str) -> None:
     os.execvp("ssh", ["ssh", "-t", REMOTE, command])
 
 
-def main() -> None:
+def add_project_arguments(parser: argparse.ArgumentParser, *, cmux: bool = False) -> None:
+    parser.add_argument("project", nargs="?", help="project name or path; defaults to the current Git repository")
+    parser.add_argument("--pick", action="store_true", help="choose interactively from the projects directory")
+    parser.add_argument("--host", default="", help="configured host name or SSH destination")
+    parser.add_argument(
+        "--profile",
+        default="auto",
+        help="host capability role (auto detects macos; custom configured roles are accepted)",
+    )
+    if cmux:
+        parser.add_argument("--cmux", action="store_true", help="open or reuse a cmux workspace")
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ompup",
+        description="Safely continue a local Git project inside persistent OMP on a remote machine.",
+    )
+    parser.add_argument("--version", action="version", version=f"ompup {VERSION}")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name, help_text in (
+        ("up", "bootstrap or sync when needed, then attach OMP"),
+        ("shell", "bootstrap or sync when needed, then attach a shell"),
+        ("sync", "transfer local commits and working state without attaching"),
+        ("pull", "transfer remote commits and working state to local"),
+        ("status", "show selected host, synchronization, and tmux state"),
+        ("doctor", "probe configured hosts and explain selection"),
+    ):
+        subparser = commands.add_parser(name, help=help_text)
+        add_project_arguments(subparser, cmux=name in {"up", "shell"})
+    hosts_parser = commands.add_parser("hosts", help="probe every configured host")
+    hosts_parser.add_argument("--json", action="store_true", help="emit probe data as JSON")
+    pin_parser = commands.add_parser("pin", help="pin a project to one configured host")
+    pin_parser.add_argument("host")
+    pin_parser.add_argument("project", nargs="?")
+    pin_parser.add_argument("--pick", action="store_true")
+    unpin_parser = commands.add_parser("unpin", help="remove a project's host pin")
+    unpin_parser.add_argument("project", nargs="?")
+    unpin_parser.add_argument("--pick", action="store_true")
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
     argv = sys.argv[1:]
-    command = argv.pop(0) if argv else "up"
-    if command in {"help", "-h", "--help"}:
-        usage()
-        return
-    if command in {"version", "--version"}:
-        print(f"ompup {VERSION}")
-        return
-    if command not in {"up", "sync", "pull", "status", "shell"}:
-        die(f"unknown command {command!r}; use up, sync, pull, status, or shell")
-    if argv:
-        die(f"{command} takes no additional arguments")
-    if not HOST:
-        die("set OMPUP_HOST to your remote SSH host or alias")
+    commands = {"up", "shell", "sync", "pull", "status", "doctor", "hosts", "pin", "unpin"}
+    if not argv:
+        argv = ["up"]
+    elif argv[0] not in commands and argv[0] not in {"-h", "--help", "--version"}:
+        argv.insert(0, "up")
+    return create_parser().parse_args(argv)
+
+
+def validate_local_requirements() -> None:
     if not REMOTE_ROOT or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", REMOTE_ROOT):
         die("OMPUP_REMOTE_ROOT must be a relative path of safe directory names")
     if any(part in {".", ".."} for part in REMOTE_ROOT.split("/")):
@@ -517,30 +666,195 @@ def main() -> None:
         if shutil.which(executable) is None:
             die(f"required local command not found: {executable}")
 
-    root = project_root()
-    project = root.name
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", project):
-        die(f"project name {project!r} is not safe for remote paths")
+
+def host_context(
+    root: Path,
+    project: str,
+    requested_host: str,
+    requested_profile: str,
+    *,
+    persist: bool = True,
+    probe_all: bool = False,
+) -> tuple[HostChoice, list[HostProbe], str, str, str]:
+    global LAUNCH, REMOTE
     remote_dir = f"{REMOTE_ROOT}/{project}"
-    state_key = f"{hashlib.sha256(remote_dir.encode()).hexdigest()[:16]}-{project}"
     session = re.sub(r"[^a-z0-9_.:-]", "", project.lower().replace(" ", "-"))
-    identity, origin = project_identity(root)
+    hosts = load_hosts(LEGACY_HOST)
+    profile = project_profile(root, requested_profile)
+    explicit = requested_host or (LEGACY_HOST if LEGACY_HOST not in {"", "auto"} else "")
+    requested = explicit or pinned_host(root)
+    probe_targets = hosts if probe_all or not requested else [find_host(hosts, requested)]
+    probes = probe_hosts(probe_targets, remote_dir, session)
+    choice = choose_host(hosts, probes, root, profile, explicit)
+    REMOTE = choice.host.ssh
+    LAUNCH = LAUNCH_OVERRIDE or choice.host.launch
+    if persist and not pinned_host(root):
+        pin_host(root, choice.host.name)
+    state_key = f"{hashlib.sha256(remote_dir.encode()).hexdigest()[:16]}-{project}"
+    return choice, probes, remote_dir, session, state_key
 
-    if command == "status":
-        show_status(root, state_key, remote_dir, identity, session)
-        return
-    if command == "pull":
-        sync_down(root, state_key, remote_dir, identity)
-        return
-    if command == "sync":
-        sync_up(root, project, state_key, remote_dir, identity, origin)
-        return
 
-    if remote_exists(remote_dir) and session_exists(session):
-        print("ompup: existing tmux session found; attaching without changing its checkout")
-    else:
-        sync_up(root, project, state_key, remote_dir, identity, origin)
-    attach(session, remote_dir, "" if command == "shell" else LAUNCH)
+def print_banner(root: Path, project: str, choice: HostChoice, profile: str) -> None:
+    status = git(root, "status", "--porcelain")
+    branch_result = run(
+        ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        check=False,
+        capture=True,
+    )
+    branch = branch_result.stdout.strip() or "detached"
+    dirty = len(status.splitlines()) if status else 0
+    probe = choice.probe
+    print(
+        f"ompup: {project} -> {choice.host.name} ({choice.reason}); "
+        f"{probe.system}/{probe.arch}, {probe.free_gb:.0f} GB free, "
+        f"load {probe.load1:.2f}/{probe.cpu_count} CPU; "
+        f"{branch}, {dirty} changed path{'s' if dirty != 1 else ''}; profile {profile}"
+    )
+
+
+def show_hosts(as_json: bool = False) -> None:
+    hosts = load_hosts(LEGACY_HOST)
+    probes = probe_hosts(hosts, f"{REMOTE_ROOT}/.ompup-probe", ".ompup-probe")
+    if as_json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "name": probe.host.name,
+                        "ssh": probe.host.ssh,
+                        "roles": probe.host.roles,
+                        "reachable": probe.reachable,
+                        "tools_ok": probe.tools_ok,
+                        "system": probe.system,
+                        "arch": probe.arch,
+                        "cpu_count": probe.cpu_count,
+                        "load1": probe.load1,
+                        "memory_available": probe.memory_available,
+                        "disk_free": probe.disk_free,
+                        "latency_ms": probe.latency_ms,
+                        "error": probe.error,
+                    }
+                    for probe in probes
+                ],
+                indent=2,
+            )
+        )
+        return
+    for probe in probes:
+        print(format_probe(probe))
+
+
+def open_cmux(root: Path, project: str, host_name: str, command: str) -> None:
+    if shutil.which("cmux") is None:
+        die("cmux is not installed")
+    if run(["cmux", "ping"], check=False, capture=True).returncode != 0:
+        die("cmux is installed but no live runtime is reachable")
+    title = f"ompup:{project}@{host_name}"
+    result = run(["cmux", "workspace", "list", "--json"], capture=True)
+    payload = json.loads(result.stdout)
+    existing = next(
+        (
+            workspace
+            for workspace in payload.get("workspaces", [])
+            if workspace.get("custom_title") == title or workspace.get("title") == title
+        ),
+        None,
+    )
+    if existing:
+        run(["cmux", "workspace", "select", existing["ref"]])
+        print(f"ompup: selected existing cmux workspace {title}")
+        return
+    executable = str(Path(__file__).resolve())
+    launch_command = " ".join(
+        shlex.quote(part)
+        for part in (executable, command, str(root), "--host", host_name)
+    )
+    run(
+        [
+            "cmux",
+            "workspace",
+            "create",
+            "--name",
+            title,
+            "--description",
+            f"Persistent remote OMP on {host_name}",
+            "--cwd",
+            str(root),
+            "--command",
+            launch_command,
+            "--focus",
+            "true",
+        ]
+    )
+
+
+def run_doctor(root: Path, project: str, args: argparse.Namespace) -> None:
+    choice, probes, remote_dir, session, _ = host_context(
+        root, project, args.host, args.profile, persist=False, probe_all=True
+    )
+    for probe in probes:
+        marker = "*" if probe.host.name == choice.host.name else " "
+        print(f"{marker} {format_probe(probe)}")
+    print(f"selected {choice.host.name}: {choice.reason}")
+    print(f"remote path ~/{remote_dir}; tmux session {session}")
+
+
+def main() -> None:
+    global LAUNCH, REMOTE
+    args = parse_args()
+    validate_local_requirements()
+    try:
+        if args.command == "hosts":
+            show_hosts(args.json)
+            return
+        root = resolve_project(getattr(args, "project", "") or "", getattr(args, "pick", False))
+        project = root.name
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", project):
+            die(f"project name {project!r} is not safe for remote paths")
+        hosts = load_hosts(LEGACY_HOST)
+        if args.command == "pin":
+            host = find_host(hosts, args.host)
+            pin_host(root, host.name)
+            print(f"ompup: pinned {project} to {host.name}")
+            return
+        if args.command == "unpin":
+            unpin_host(root)
+            print(f"ompup: removed host pin for {project}")
+            return
+        if args.command == "doctor":
+            run_doctor(root, project, args)
+            return
+
+        choice, _, remote_dir, session, state_key = host_context(
+            root,
+            project,
+            args.host,
+            args.profile,
+            persist=args.command != "status",
+        )
+        profile = project_profile(root, args.profile)
+        identity, origin = project_identity(root)
+        print_banner(root, project, choice, profile)
+        if getattr(args, "cmux", False):
+            open_cmux(root, project, choice.host.name, args.command)
+            return
+        if args.command == "status":
+            show_status(root, state_key, remote_dir, identity, session)
+            return
+        if args.command == "pull":
+            sync_down(root, project, state_key, remote_dir, identity)
+            return
+        if args.command == "sync":
+            sync_up(root, project, state_key, remote_dir, identity, origin)
+            return
+
+        if choice.probe.project_exists and choice.probe.session_exists:
+            print("ompup: existing tmux session found; attaching without changing its checkout")
+        else:
+            sync_up(root, project, state_key, remote_dir, identity, origin)
+        attach(session, remote_dir, "" if args.command == "shell" else LAUNCH)
+    except HostSelectionError as error:
+        die(str(error))
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 /**
  * ompup omp extension.
  *
- * Adds a /ompup slash command so you can push the current project to your
- * remote box without leaving the session:
+ * Adds a /ompup slash command so you can synchronize the current project with
+ * its selected remote machine without leaving the session:
  *
  *   /ompup sync     safely transfer local uncommitted state to the remote
  *   /ompup pull     safely transfer remote uncommitted state to this checkout
@@ -10,8 +10,8 @@
  *
  * The interactive jump (tmux attach + omp launch) stays in the standalone
  * `ompup` CLI; a TUI session cannot hand its terminal to a remote tmux.
- * Configuration comes from the same environment variables as the CLI
- * (OMPUP_HOST and friends).
+ * Configuration and host selection use the same inventory, project pin, and
+ * environment overrides as the CLI.
  */
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
