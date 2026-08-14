@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ompup - jump from any local project directory into a synced omp session
+# on your remote box: rsync the working tree up, attach a tmux session named
+# after the project, and launch omp inside it.
+#
+#   ompup              sync local -> remote, attach tmux, run omp
+#   ompup sync         sync only, no attach (used by the omp extension)
+#   ompup pull         sync remote -> local (no --delete; brings work home)
+#   ompup status       remote git status + tmux session state
+#   ompup shell        sync and attach a plain shell instead of omp
+#
+# Git stays canonical: commit and push from either side. rsync only carries
+# uncommitted working state so you can jump mid-thought. Secrets (.env*,
+# keys) and dependency/build directories never sync.
+#
+# Configuration (environment):
+#   OMPUP_HOST         SSH host or alias for the remote box (required)
+#   OMPUP_REMOTE_ROOT  remote directory under $HOME for projects
+#                      (default: Projects)
+#   OMPUP_CMD          command launched inside tmux (default: omp)
+#   OMPUP_EXCLUDES     extra colon-separated rsync exclude patterns
+set -euo pipefail
+
+VERSION="0.1.0"
+
+die() { printf 'ompup: %s\n' "$*" >&2; exit 1; }
+
+HOST="${OMPUP_HOST:-}"
+[ -n "$HOST" ] || die "set OMPUP_HOST to your remote SSH host or alias"
+REMOTE_ROOT="${OMPUP_REMOTE_ROOT:-Projects}"
+LAUNCH="${OMPUP_CMD:-omp}"
+
+root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+proj="$(basename "$root")"
+[[ "$proj" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "project name '$proj' is not safe for remote paths"
+remote_dir="$REMOTE_ROOT/$proj"   # relative to remote $HOME
+session="$(printf '%s' "$proj" | tr '[:upper:] ' '[:lower:]-' | tr -cd '[:alnum:]_.:-')"
+
+EXCLUDES=(
+  --exclude '.env' --exclude '.env.*' --exclude '*.pem' --exclude '*.key'
+  --exclude 'node_modules/' --exclude '.venv/' --exclude 'venv/'
+  --exclude '__pycache__/' --exclude '.pytest_cache/' --exclude '.mypy_cache/'
+  --exclude 'target/' --exclude 'dist/' --exclude 'build/' --exclude '.next/'
+  --exclude '.turbo/' --exclude '.cache/' --exclude '.DS_Store'
+)
+if [ -n "${OMPUP_EXCLUDES:-}" ]; then
+  IFS=':' read -ra extra <<< "$OMPUP_EXCLUDES"
+  for pat in "${extra[@]}"; do
+    [ -n "$pat" ] && EXCLUDES+=(--exclude "$pat")
+  done
+fi
+
+remote_exists() { ssh "$HOST" "test -d '$remote_dir'"; }
+remote_dirty()  { ssh "$HOST" "git -C '$remote_dir' status --porcelain 2>/dev/null" | grep -q .; }
+
+sync_up() {
+  if remote_exists && remote_dirty; then
+    # Never clobber work done on the box; up-sync uses --delete.
+    printf 'ompup: remote %s has uncommitted changes.\n' "$HOST:~/$remote_dir" >&2
+    printf 'ompup: commit and push there, or run `ompup pull` first. Skipping sync.\n' >&2
+    return 1
+  fi
+  ssh "$HOST" "mkdir -p '$remote_dir'"
+  rsync -az --delete "${EXCLUDES[@]}" "$root/" "$HOST:$remote_dir/"
+}
+
+attach() {
+  local launch="$1"
+  # -A: attach if the session exists, create otherwise. On create, land in
+  # the project directory; fall back to a shell so quitting doesn't kill
+  # the session.
+  if [ -n "$launch" ]; then
+    exec ssh -t "$HOST" "tmux new-session -A -s '$session' -c \"\$HOME/$remote_dir\" '$launch; exec \$SHELL'"
+  else
+    exec ssh -t "$HOST" "tmux new-session -A -s '$session' -c \"\$HOME/$remote_dir\""
+  fi
+}
+
+cmd="${1:-up}"
+case "$cmd" in
+  up)
+    sync_up || true
+    attach "$LAUNCH"
+    ;;
+  shell)
+    sync_up || true
+    attach ""
+    ;;
+  sync)
+    sync_up
+    printf 'ompup: synced %s -> %s\n' "$root" "$HOST:~/$remote_dir"
+    ;;
+  pull)
+    remote_exists || die "nothing at $HOST:~/$remote_dir"
+    # No --delete: pull merges remote work onto local; git shows the diff.
+    rsync -az "${EXCLUDES[@]}" "$HOST:$remote_dir/" "$root/"
+    git -C "$root" status --short 2>/dev/null || true
+    ;;
+  status)
+    ssh "$HOST" "
+      echo '== git (~/$remote_dir)';
+      git -C '$remote_dir' status --short --branch 2>/dev/null || echo '(no remote checkout)';
+      echo '== tmux';
+      tmux list-sessions 2>/dev/null | grep '^$session:' || echo '(no session $session)'
+    "
+    ;;
+  version|--version)
+    printf 'ompup %s\n' "$VERSION"
+    ;;
+  -h|--help|help)
+    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    die "unknown command '$cmd' (up|sync|pull|status|shell; default up)"
+    ;;
+esac
