@@ -28,7 +28,7 @@ local working tree ──verified snapshot──────>        │
 
 ## Requirements
 
-- Local: Python 3.9 or newer, `ssh`, `rsync`, `git`, and `gitleaks`
+- Local: Python 3.12 or newer, `ssh`, `rsync`, `git`, and `gitleaks`
 - Remote: Bash, `tmux`, `rsync`, `git`, and `omp` on `PATH`
 - An SSH host or alias that reaches your box (an entry in `~/.ssh/config` works well)
 
