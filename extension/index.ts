@@ -75,6 +75,12 @@ export default function ompup(pi: ExtensionAPI) {
           return;
         }
         await ctx.waitForIdle();
+        const runningJobs = ctx.getAsyncJobSnapshot()?.running ?? [];
+        if (runningJobs.length) {
+          const jobs = runningJobs.map((job) => job.label || job.id).join(", ");
+          ctx.ui.notify(`Wait for or cancel active background jobs before handoff: ${jobs}`, "error");
+          return;
+        }
         const sessionFile = ctx.sessionManager.getSessionFile();
         if (!sessionFile) {
           ctx.ui.notify("The active session is not persisted yet; send one message before handoff", "error");

@@ -11,7 +11,7 @@
     "ompup": "./bin/ompup"
   },
   "scripts": {
-    "test": "python3 -m unittest discover -s tests -v"
+    "test": "python3 -m unittest discover -s tests -v && bun test tests/extension.test.ts"
   },
   "omp": {
     "extensions": ["./extension/index.ts"]

@@ -145,6 +145,7 @@ The capacity score uses declared roles, minimum free-space reserves, free disk, 
 - Fast-forward commits transfer automatically. Divergent history requires normal Git reconciliation.
 - `ompup pull` may delete local paths to reproduce the remote snapshot, but only when the local checkout exactly matches the recorded baseline.
 - A successful handoff keeps the local session file as a rollback copy. A failed transfer, checksum, remote load, launch, or cmux replacement leaves local OMP running and removes only remote state created by that attempt.
+- Handoff refuses while asynchronous jobs are running because their local processes cannot migrate with the session transcript.
 - Handoff refuses to overwrite an existing project tmux session. Attach that session or select another host.
 - If cmux cannot respawn the calling surface, ompup opens a focused fallback workspace and closes the old surface when cmux can identify it.
 
