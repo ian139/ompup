@@ -17,29 +17,44 @@ from typing import Iterable
 
 from .hosts import CONFIG_PATH, HostConfig, HostSelectionError, find_host
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 AGENT_HOME = Path(os.environ.get("OMPUP_AGENT_HOME", Path.home() / ".omp/agent")).expanduser()
 CONFIG_ROOT = Path(os.environ.get("PI_CONFIG_DIR", Path.home() / ".omp")).expanduser()
 STATE_ROOT = Path(".local/state/ompup/environment")
 LOCAL_CACHE_ROOT = Path.home() / ".local/state/ompup/environment/local-cache"
 SHARED_FILES = ("AGENTS.md", "RULES.md", "WATCHDOG.md", "config-spark.yml")
 SHARED_ENTRY_DIRS = ("skills", "agents", "commands", "rules", "hooks")
-SHARED_WHOLE_DIRS = ("docs", "maintainer-preferences")
+SHARED_WHOLE_DIRS = ("docs",)
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
-PORTABLE_EXTENSIONS = ("orca-agent-status.ts", "orca-prefill.ts", "orca-titlebar-spinner.ts")
-BLOCKED_SKILLS = {"website-deployment"}
+ENVIRONMENT_KEYS = {
+    "mode",
+    "auth_host",
+    "auth_broker_url",
+    "include_extensions",
+    "exclude_skills",
+    "plugins",
+}
 HOST_LOCAL = (
     "agent.db and all SQLite sidecars",
     "sessions, histories, memories, caches, blobs, logs, and terminal state",
     ".env and credential files",
     "mcp.json, models.yml, and ssh.json",
-    "skills disabled by local config and skills containing credential-bearing runtime data",
-    "cmux, Pompup, IRC visualization, and local episodic-memory extensions",
+    "skills disabled or excluded by local configuration",
+    "extensions and plugins not explicitly included",
 )
 COPY_IGNORE_NAMES = (
     ".git",
     ".env",
     ".env.*",
+    ".envrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials.json",
+    "token.json",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
     ".DS_Store",
     "__pycache__",
     "*.pyc",
@@ -72,7 +87,6 @@ release = Path(sys.argv[1]).expanduser().resolve()
 home = Path.home()
 state_root = home / ".local/state/ompup/environment"
 manifest = json.loads((release / "manifest.json").read_text())
-agent_home = home / ".omp/agent"
 backup = state_root / "backups" / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 backup_used = False
 
@@ -191,6 +205,9 @@ for entry in manifest["targets"]:
     target = home / entry["target"]
     if not target.exists() or digest(target) != entry["sha256"]:
         mismatches.append(entry["target"])
+token_target = manifest.get("authTokenTarget")
+if token_target and not (home / token_target).is_file():
+    mismatches.append(token_target)
 shell = os.environ.get("SHELL", "/bin/sh")
 version = subprocess.run([shell, "-lc", f"{launch} --version"], text=True, capture_output=True)
 print(json.dumps({
@@ -205,8 +222,12 @@ print(json.dumps({
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
-    auth_host: str
-    broker_url: str
+    mode: str = "preserve"
+    auth_host: str = ""
+    broker_url: str = ""
+    include_extensions: tuple[str, ...] = ()
+    exclude_skills: tuple[str, ...] = ()
+    plugins: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -233,23 +254,49 @@ class EnvironmentStatus:
     synced: bool = False
 
 
+def _string_list(raw: object, field: str) -> tuple[str, ...]:
+    if not isinstance(raw, list) or any(not isinstance(item, str) or not item.strip() for item in raw):
+        raise HostSelectionError(f"environment.{field} must be an array of nonempty strings")
+    return tuple(dict.fromkeys(item.strip() for item in raw))
+
+
 def load_environment_config() -> EnvironmentConfig:
     try:
         payload = json.loads(CONFIG_PATH.read_text())
     except (OSError, ValueError, TypeError) as error:
         raise HostSelectionError(f"invalid host configuration {CONFIG_PATH}: {error}") from error
+    if not isinstance(payload, dict):
+        raise HostSelectionError(f"host configuration {CONFIG_PATH} must be an object")
     raw = payload.get("environment", {})
     if not isinstance(raw, dict):
         raise HostSelectionError(f"environment in {CONFIG_PATH} must be an object")
-    auth_host = str(raw.get("auth_host", "")).strip()
-    broker_url = str(raw.get("auth_broker_url", "")).strip()
-    if not auth_host or not broker_url:
-        raise HostSelectionError(
-            f"environment in {CONFIG_PATH} needs auth_host and auth_broker_url"
-        )
-    if not broker_url.startswith(("http://", "https://")):
+    unknown = sorted(set(raw) - ENVIRONMENT_KEYS)
+    if unknown:
+        raise HostSelectionError(f"environment has unknown field(s): {', '.join(unknown)}")
+    mode = raw.get("mode", "preserve")
+    if mode not in {"preserve", "mirror"}:
+        raise HostSelectionError("environment.mode must be preserve or mirror")
+    auth_host = raw.get("auth_host", "")
+    broker_url = raw.get("auth_broker_url", "")
+    if not isinstance(auth_host, str) or not isinstance(broker_url, str):
+        raise HostSelectionError("environment auth_host and auth_broker_url must be strings")
+    auth_host = auth_host.strip()
+    broker_url = broker_url.strip().rstrip("/")
+    if bool(auth_host) != bool(broker_url):
+        raise HostSelectionError("environment auth_host and auth_broker_url must be configured together")
+    if broker_url and not broker_url.startswith(("http://", "https://")):
         raise HostSelectionError("auth_broker_url must be an http(s) URL")
-    return EnvironmentConfig(auth_host=auth_host, broker_url=broker_url.rstrip("/"))
+    include_extensions = _string_list(raw.get("include_extensions", []), "include_extensions")
+    if any(Path(name).name != name or name in {".", ".."} for name in include_extensions):
+        raise HostSelectionError("environment.include_extensions entries must be file names")
+    return EnvironmentConfig(
+        mode=mode,
+        auth_host=auth_host,
+        broker_url=broker_url,
+        include_extensions=include_extensions,
+        exclude_skills=_string_list(raw.get("exclude_skills", []), "exclude_skills"),
+        plugins=_string_list(raw.get("plugins", []), "plugins"),
+    )
 
 
 def _run(command: list[str], *, input_bytes: bytes | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -272,8 +319,10 @@ def _omp_version() -> str:
 def _render_config(source: Path, broker_url: str, *, remote: bool) -> bytes:
     yq = shutil.which("yq")
     if yq is None:
-        raise RuntimeError("yq is required to build the shared OMP configuration")
-    expression = '.auth.broker.url = strenv(OMPUP_BROKER_URL)'
+        raise RuntimeError("Mike Farah yq v4 is required to build the shared OMP configuration")
+    expression = "."
+    if broker_url:
+        expression += " | .auth.broker.url = strenv(OMPUP_BROKER_URL)"
     if remote:
         expression += " | .extensions = [] | .speech.enabled = false | .sonification.enabled = false | .computer.enabled = false | .browser.headless = true"
     env = os.environ.copy()
@@ -331,21 +380,32 @@ def _digest(path: Path) -> str:
     return value.hexdigest()
 
 
-def _plugin_versions() -> dict[str, str]:
+def _plugin_versions(config: EnvironmentConfig) -> dict[str, str]:
+    if not config.plugins:
+        return {}
     lock = CONFIG_ROOT / "plugins/omp-plugins.lock.json"
     if not lock.is_file():
-        return {}
-    payload = json.loads(lock.read_text())
-    plugins = payload.get("plugins", {})
-    return {
-        name: str(config["version"])
-        for name, config in plugins.items()
-        if name != "ompup" and isinstance(config, dict) and config.get("enabled", True) and config.get("version")
-    }
+        raise RuntimeError(f"plugin lock is unavailable: {lock}")
+    try:
+        payload = json.loads(lock.read_text())
+        plugins = payload.get("plugins", {})
+    except (OSError, ValueError, TypeError) as error:
+        raise RuntimeError(f"invalid plugin lock {lock}: {error}") from error
+    if not isinstance(plugins, dict):
+        raise RuntimeError(f"invalid plugin lock {lock}: plugins must be an object")
+    selected: dict[str, str] = {}
+    for name in config.plugins:
+        plugin = plugins.get(name)
+        if not isinstance(plugin, dict) or not plugin.get("enabled", True) or not plugin.get("version"):
+            raise RuntimeError(f"configured portable plugin is unavailable or disabled: {name}")
+        selected[name] = str(plugin["version"])
+    return selected
+
+
 def _ignored_skills() -> tuple[str, ...]:
     yq = shutil.which("yq")
     if yq is None:
-        raise RuntimeError("yq is required to resolve the active skill set")
+        raise RuntimeError("Mike Farah yq v4 is required to resolve the active skill set")
     result = subprocess.run(
         [yq, "-o=json", ".skills.ignoredSkills // []", str(AGENT_HOME / "config.yml")],
         capture_output=True,
@@ -358,38 +418,38 @@ def _ignored_skills() -> tuple[str, ...]:
     return tuple(str(item) for item in payload if isinstance(item, str))
 
 
-def _excluded_skill_names() -> set[str]:
+def _excluded_skill_names(config: EnvironmentConfig) -> set[str]:
     source = AGENT_HOME / "skills"
     if not source.is_dir():
         return set()
-    patterns = _ignored_skills()
+    patterns = (*_ignored_skills(), *config.exclude_skills)
     return {
         entry.name
         for entry in source.iterdir()
-        if entry.name in BLOCKED_SKILLS
-        or any(fnmatch.fnmatch(entry.name, pattern) for pattern in patterns)
+        if any(fnmatch.fnmatch(entry.name, pattern) for pattern in patterns)
     }
 
 
-
-
-def _build_release_uncached(broker_url: str) -> EnvironmentRelease:
+def _build_release_uncached(config: EnvironmentConfig, host: HostConfig) -> EnvironmentRelease:
     temporary = Path(tempfile.mkdtemp(prefix="ompup-environment-"))
     payload = temporary / "payload"
-    excluded_skills = _excluded_skill_names()
+    excluded_skills = _excluded_skill_names(config)
     targets: list[dict[str, str]] = []
+
+    def agent_target(relative: str) -> str:
+        return f"{host.remote_agent_home}/{relative}"
 
     config_target = payload / "agent/config.yml"
     config_target.parent.mkdir(parents=True, exist_ok=True)
-    config_target.write_bytes(_render_config(AGENT_HOME / "config.yml", broker_url, remote=True))
-    targets.append({"source": "agent/config.yml", "target": ".omp/agent/config.yml", "mode": "copy"})
+    config_target.write_bytes(_render_config(AGENT_HOME / "config.yml", config.broker_url, remote=True))
+    targets.append({"source": "agent/config.yml", "target": agent_target("config.yml"), "mode": "copy"})
 
     for name in SHARED_FILES:
         source = AGENT_HOME / name
         if source.exists():
             relative = f"agent/{name}"
             _copy_entry(source, payload / relative)
-            targets.append({"source": relative, "target": f".omp/agent/{name}", "mode": "link"})
+            targets.append({"source": relative, "target": agent_target(name), "mode": "link"})
 
     for directory in SHARED_ENTRY_DIRS:
         source_dir = AGENT_HOME / directory
@@ -402,38 +462,52 @@ def _build_release_uncached(broker_url: str) -> EnvironmentRelease:
                 continue
             relative = f"agent/{directory}/{source.name}"
             _copy_entry(source, payload / relative)
-            targets.append({"source": relative, "target": f".omp/agent/{directory}/{source.name}", "mode": "link"})
+            targets.append(
+                {
+                    "source": relative,
+                    "target": agent_target(f"{directory}/{source.name}"),
+                    "mode": "link",
+                }
+            )
 
     for directory in SHARED_WHOLE_DIRS:
         source = AGENT_HOME / directory
         if source.is_dir():
             relative = f"agent/{directory}"
             _copy_entry(source, payload / relative)
-            targets.append({"source": relative, "target": f".omp/agent/{directory}", "mode": "link"})
+            targets.append({"source": relative, "target": agent_target(directory), "mode": "link"})
 
-    for name in PORTABLE_EXTENSIONS:
+    for name in config.include_extensions:
         source = AGENT_HOME / "extensions" / name
-        if source.is_file():
-            relative = f"agent/extensions/{name}"
-            _copy_entry(source, payload / relative)
-            targets.append({"source": relative, "target": f".omp/agent/extensions/{name}", "mode": "link"})
+        if not source.is_file():
+            raise RuntimeError(f"configured portable extension is unavailable: {name}")
+        relative = f"agent/extensions/{name}"
+        _copy_entry(source, payload / relative)
+        targets.append(
+            {"source": relative, "target": agent_target(f"extensions/{name}"), "mode": "link"}
+        )
 
     _copy_entry(PLUGIN_ROOT, payload / "plugins/ompup")
-    plugin_versions = _plugin_versions()
+    plugin_versions = _plugin_versions(config)
     for package in plugin_versions:
         source = CONFIG_ROOT / "plugins/node_modules" / package
         if not source.is_dir():
-            raise RuntimeError(f"enabled plugin source is unavailable: {package}")
+            raise RuntimeError(f"configured portable plugin source is unavailable: {package}")
         _copy_entry(source, payload / "plugins" / package)
 
     for target in targets:
         target["sha256"] = _digest(payload / target["source"])
+    omp_version = _omp_version()
+    auth_token_target = (
+        f"{host.remote_config_root}/auth-broker.token" if config.broker_url else None
+    )
     fingerprint_input = json.dumps(
         {
             "schema": SCHEMA_VERSION,
-            "ompVersion": _omp_version(),
+            "ompVersion": omp_version,
             "targets": targets,
             "externalPlugins": plugin_versions,
+            "authTokenTarget": auth_token_target,
             "plugins": {
                 "ompup": _digest(payload / "plugins/ompup"),
                 **{
@@ -448,12 +522,15 @@ def _build_release_uncached(broker_url: str) -> EnvironmentRelease:
     manifest = {
         "schema": SCHEMA_VERSION,
         "fingerprint": hashlib.sha256(fingerprint_input).hexdigest(),
-        "ompVersion": _omp_version(),
+        "ompVersion": omp_version,
         "targets": targets,
         "externalPlugins": plugin_versions,
+        "authTokenTarget": auth_token_target,
         "hostLocal": list(HOST_LOCAL),
         "excludedExtensions": sorted(
-            path.name for path in (AGENT_HOME / "extensions").glob("*.ts") if path.name not in PORTABLE_EXTENSIONS
+            path.name
+            for path in (AGENT_HOME / "extensions").glob("*")
+            if path.is_file() and path.name not in config.include_extensions
         ),
         "excludedSkills": sorted(excluded_skills),
     }
@@ -464,14 +541,13 @@ def _build_release_uncached(broker_url: str) -> EnvironmentRelease:
     return EnvironmentRelease(temporary, manifest)
 
 
-def _signature_entry(label: str, source: Path) -> list[tuple[str, int, int, int]]:
+def _signature_entry(label: str, source: Path) -> list[tuple[str, int, str]]:
     if not source.exists():
         return []
     resolved = source.resolve()
     if resolved.is_file():
-        details = resolved.stat()
-        return [(label, details.st_size, details.st_mtime_ns, stat.S_IMODE(details.st_mode))]
-    entries: list[tuple[str, int, int, int]] = []
+        return [(label, stat.S_IMODE(resolved.stat().st_mode), _digest(resolved))]
+    entries: list[tuple[str, int, str]] = []
     visited: set[tuple[int, int]] = set()
     for current, directories, files in os.walk(resolved, followlinks=True):
         current_path = Path(current)
@@ -495,25 +571,19 @@ def _signature_entry(label: str, source: Path) -> list[tuple[str, int, int, int]
                 continue
             child = current_path / name
             try:
-                details = child.stat()
+                mode = stat.S_IMODE(child.stat().st_mode)
+                digest = _digest(child)
             except OSError:
                 continue
-            entries.append(
-                (
-                    f"{label}/{child.relative_to(resolved)}",
-                    details.st_size,
-                    details.st_mtime_ns,
-                    stat.S_IMODE(details.st_mode),
-                )
-            )
+            entries.append((f"{label}/{child.relative_to(resolved)}", mode, digest))
     return entries
 
 
-def _source_signature(broker_url: str) -> str:
-    entries: list[tuple[str, int, int, int]] = []
+def _source_signature(config: EnvironmentConfig, host: HostConfig) -> str:
+    entries: list[tuple[str, int, str]] = []
     for name in SHARED_FILES:
         entries.extend(_signature_entry(f"agent/{name}", AGENT_HOME / name))
-    excluded_skills = _excluded_skill_names()
+    excluded_skills = _excluded_skill_names(config)
     for directory in SHARED_ENTRY_DIRS:
         source = AGENT_HOME / directory
         if directory == "skills" and source.is_dir():
@@ -524,12 +594,13 @@ def _source_signature(broker_url: str) -> str:
             entries.extend(_signature_entry(f"agent/{directory}", source))
     for directory in SHARED_WHOLE_DIRS:
         entries.extend(_signature_entry(f"agent/{directory}", AGENT_HOME / directory))
-    for name in PORTABLE_EXTENSIONS:
+    for name in config.include_extensions:
         entries.extend(_signature_entry(f"agent/extensions/{name}", AGENT_HOME / "extensions" / name))
     entries.extend(_signature_entry("agent/config.yml", AGENT_HOME / "config.yml"))
     entries.extend(_signature_entry("plugins/ompup", PLUGIN_ROOT))
-    entries.extend(_signature_entry("plugins/lock", CONFIG_ROOT / "plugins/omp-plugins.lock.json"))
-    for package in _plugin_versions():
+    if config.plugins:
+        entries.extend(_signature_entry("plugins/lock", CONFIG_ROOT / "plugins/omp-plugins.lock.json"))
+    for package in _plugin_versions(config):
         entries.extend(
             _signature_entry(
                 f"plugins/{package}",
@@ -539,7 +610,14 @@ def _source_signature(broker_url: str) -> str:
     payload = json.dumps(
         {
             "schema": SCHEMA_VERSION,
-            "brokerUrl": broker_url,
+            "config": {
+                "brokerUrl": config.broker_url,
+                "includeExtensions": config.include_extensions,
+                "excludeSkills": config.exclude_skills,
+                "plugins": config.plugins,
+                "remoteAgentHome": host.remote_agent_home,
+                "remoteConfigRoot": host.remote_config_root,
+            },
             "ompVersion": _omp_version(),
             "entries": sorted(entries),
         },
@@ -549,37 +627,40 @@ def _source_signature(broker_url: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def build_release(broker_url: str) -> EnvironmentRelease:
-    signature = _source_signature(broker_url)
-    index_path = LOCAL_CACHE_ROOT / "index.json"
+def build_release(config: EnvironmentConfig, host: HostConfig) -> EnvironmentRelease:
+    if config.mode != "mirror":
+        raise RuntimeError("environment releases require environment.mode mirror")
+    signature = _source_signature(config, host)
+    index_path = LOCAL_CACHE_ROOT / "indexes" / f"{signature}.json"
     try:
         index = json.loads(index_path.read_text())
         cached = LOCAL_CACHE_ROOT / "releases" / str(index["fingerprint"])
-        if index.get("sourceSignature") == signature and (cached / "manifest.json").is_file():
+        if (cached / "manifest.json").is_file():
             manifest = json.loads((cached / "manifest.json").read_text())
             return EnvironmentRelease(cached, manifest, ephemeral=False)
     except (OSError, ValueError, KeyError, TypeError):
         pass
 
-    release = _build_release_uncached(broker_url)
+    release = _build_release_uncached(config, host)
     destination = LOCAL_CACHE_ROOT / "releases" / release.fingerprint
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if destination.exists():
-        shutil.rmtree(destination)
-    os.replace(release.root, destination)
+        shutil.rmtree(release.root)
+    else:
+        try:
+            os.rename(release.root, destination)
+        except OSError:
+            if not (destination / "manifest.json").is_file():
+                raise
+            shutil.rmtree(release.root, ignore_errors=True)
     index_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = index_path.with_name(f".index.{os.getpid()}")
+    temporary = index_path.with_name(
+        f".{index_path.name}.{os.getpid()}.{time.time_ns()}"
+    )
     temporary.write_text(
-        json.dumps(
-            {"sourceSignature": signature, "fingerprint": release.fingerprint},
-            sort_keys=True,
-        )
-        + "\n"
+        json.dumps({"fingerprint": release.fingerprint}, sort_keys=True) + "\n"
     )
     os.replace(temporary, index_path)
-    for old_release in destination.parent.iterdir():
-        if old_release != destination and old_release.is_dir():
-            shutil.rmtree(old_release, ignore_errors=True)
     return EnvironmentRelease(destination, release.manifest, ephemeral=False)
 
 
@@ -629,6 +710,27 @@ def environment_status(host: HostConfig) -> EnvironmentStatus:
         mismatches=tuple(str(item) for item in payload.get("mismatches", [])),
         error=str(payload.get("reason", "")),
     )
+def preserved_environment_status(host: HostConfig) -> EnvironmentStatus:
+    command = f"{host.launch} --version"
+    try:
+        result = _run(
+            ["ssh", "-o", "ConnectTimeout=8", host.ssh, command],
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return EnvironmentStatus(host, False, False, error="connection timed out")
+    if result.returncode != 0:
+        error = result.stderr.decode(errors="replace").strip() or "remote omp --version failed"
+        return EnvironmentStatus(host, True, False, error=error)
+    version = result.stdout.decode(errors="replace").strip()
+    return EnvironmentStatus(
+        host=host,
+        reachable=True,
+        ok=bool(version),
+        omp_version=version,
+        expected_omp_version=version,
+    )
+
 
 
 def _update_remote_omp(host: HostConfig, expected: str) -> None:
@@ -661,7 +763,11 @@ def _update_remote_omp(host: HostConfig, expected: str) -> None:
 
 
 def _provision_token(host: HostConfig, token: bytes) -> None:
-    command = "umask 077; mkdir -p \"$HOME/.omp\"; cat > \"$HOME/.omp/auth-broker.token\"; chmod 600 \"$HOME/.omp/auth-broker.token\""
+    token_path = f"{host.remote_config_root}/auth-broker.token"
+    command = (
+        f'umask 077; mkdir -p "$HOME/{host.remote_config_root}"; '
+        f'cat > "$HOME/{token_path}"; chmod 600 "$HOME/{token_path}"'
+    )
     result = _run(["ssh", "-o", "ConnectTimeout=8", host.ssh, command], input_bytes=token, timeout=20)
     if result.returncode != 0:
         raise RuntimeError(f"could not provision broker token on {host.name}")
@@ -717,7 +823,12 @@ def sync_environment(host: HostConfig, release: EnvironmentRelease, token: bytes
 
 def ensure_environment(host: HostConfig, *, auto_sync: bool = True) -> EnvironmentStatus:
     config = load_environment_config()
-    release = build_release(config.broker_url)
+    if config.mode == "preserve":
+        status = preserved_environment_status(host)
+        if not status.ok:
+            raise RuntimeError(f"remote OMP is unavailable on {host.name}: {status.error}")
+        return status
+    release = build_release(config, host)
     try:
         status = environment_status(host)
         expected_version = str(release.manifest["ompVersion"])
@@ -725,8 +836,14 @@ def ensure_environment(host: HostConfig, *, auto_sync: bool = True) -> Environme
             return status
         if not auto_sync:
             return status
-        token_path = CONFIG_ROOT / "auth-broker.token"
-        token = token_path.read_bytes() if token_path.is_file() else None
+        token = None
+        if config.broker_url:
+            token_path = CONFIG_ROOT / "auth-broker.token"
+            if not token_path.is_file():
+                raise RuntimeError(
+                    f"auth broker token is missing at {token_path}; run `ompup auth setup`"
+                )
+            token = token_path.read_bytes()
         return sync_environment(host, release, token)
     finally:
         cleanup_release(release)
@@ -734,10 +851,15 @@ def ensure_environment(host: HostConfig, *, auto_sync: bool = True) -> Environme
 
 def bootstrap_auth(hosts: list[HostConfig]) -> tuple[EnvironmentConfig, bool]:
     config = load_environment_config()
+    if not config.auth_host or not config.broker_url:
+        raise HostSelectionError(
+            "auth commands require environment.auth_host and environment.auth_broker_url"
+        )
     auth_host = find_host(hosts, config.auth_host)
     token_path = CONFIG_ROOT / "auth-broker.token"
+    remote_token = f"$HOME/{auth_host.remote_config_root}/auth-broker.token"
     fetched = _run(
-        ["ssh", "-o", "ConnectTimeout=8", auth_host.ssh, "cat", "$HOME/.omp/auth-broker.token"],
+        ["ssh", "-o", "ConnectTimeout=8", auth_host.ssh, "cat", remote_token],
         timeout=20,
     )
     if fetched.returncode != 0 or len(fetched.stdout.strip()) < 24:
@@ -767,9 +889,13 @@ def select_hosts(hosts: list[HostConfig], values: Iterable[str], all_hosts: bool
     return selected
 
 
-def format_environment_status(status: EnvironmentStatus, expected: str) -> str:
+def format_environment_status(status: EnvironmentStatus, expected: str = "") -> str:
     if not status.reachable:
         return f"{status.host.name}: unreachable ({status.error})"
+    if not expected:
+        if status.ok:
+            return f"{status.host.name}: preserved ({status.omp_version})"
+        return f"{status.host.name}: unavailable ({status.error or 'unknown'})"
     if status.ok and status.fingerprint == expected and status.omp_version == status.expected_omp_version:
         return f"{status.host.name}: ready {expected[:12]} ({status.omp_version})"
     details = []

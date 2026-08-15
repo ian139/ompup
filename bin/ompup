@@ -22,9 +22,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from urllib.parse import parse_qsl, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ompup.environment import (  # noqa: E402
+    CONFIG_ROOT,
     bootstrap_auth,
     build_release,
     cleanup_release,
@@ -32,6 +34,7 @@ from ompup.environment import (  # noqa: E402
     environment_status,
     format_environment_status,
     load_environment_config,
+    preserved_environment_status,
     select_hosts,
     sync_environment,
 )
@@ -226,8 +229,9 @@ tmux has-session -t "=$session" 2>/dev/null && {
 }
 printf -v command '%q ' "$launch" --cwd "$repo" --resume "$session_file"
 tmux new-session -d -s "$session" -c "$repo" "$command"
-tmux set-option -t "$session" @ompup-environment "$fingerprint"
-sleep 2
+if [ -n "$fingerprint" ]; then
+  tmux set-option -t "$session" @ompup-environment "$fingerprint"
+fi
 tmux has-session -t "=$session" 2>/dev/null || {
   printf 'remote OMP exited before becoming attachable\n' >&2
   exit 6
@@ -302,9 +306,15 @@ def project_identity(root: Path) -> tuple[str, str]:
     material = f"origin\0{origin}" if origin else f"path\0{root}"
     identity = hashlib.sha256(material.encode()).hexdigest()
 
-    # Never copy credential-bearing or machine-local origins to the remote box.
     remote_origin = origin
-    if re.match(r"https?://[^/@]+@", origin) or (origin and origin.startswith(("/", "file:"))):
+    parsed = urlsplit(origin)
+    sensitive_query = {"access_token", "auth", "key", "password", "signature", "token"}
+    if (
+        origin.startswith(("/", "file:"))
+        or parsed.password is not None
+        or (parsed.scheme in {"http", "https"} and parsed.username is not None)
+        or any(key.lower() in sensitive_query for key, _ in parse_qsl(parsed.query))
+    ):
         remote_origin = ""
     return identity, remote_origin
 
@@ -337,6 +347,15 @@ def repository_head(root: Path) -> str:
         capture=True,
     )
     return result.stdout.strip() if result.returncode == 0 else "0" * 40
+def current_branch(root: Path) -> str:
+    result = run(
+        ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        die("detached HEAD is not supported; check out a local branch before synchronizing")
+    return result.stdout.strip()
 
 
 def local_state(root: Path) -> str:
@@ -436,7 +455,7 @@ def bootstrap(
     identity: str,
     origin: str,
 ) -> str:
-    branch = git(root, "symbolic-ref", "--short", "HEAD")
+    branch = current_branch(root)
     with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name, tempfile.TemporaryDirectory(
         prefix="ompup-bundle-"
     ) as bundle_dir:
@@ -475,7 +494,7 @@ def fast_forward_remote(root: Path, project: str, remote_dir: str, remote_head: 
     local_head = repository_head(root)
     if not is_ancestor(root, remote_head, local_head):
         die("local commit history is not a fast-forward of the remote; reconcile it with Git")
-    branch = git(root, "symbolic-ref", "--short", "HEAD")
+    branch = current_branch(root)
     scan_history(root)
     with tempfile.TemporaryDirectory(prefix="ompup-commit-bundle-") as bundle_dir:
         bundle = Path(bundle_dir) / f"{project}.bundle"
@@ -511,14 +530,10 @@ def fast_forward_local(root: Path, project: str, remote_dir: str, remote_head: s
     if result.returncode != 0:
         die("could not create a Git bundle from the remote branch")
     branch = result.stdout.strip()
-    local_branch = run(
-        ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
-        check=False,
-        capture=True,
-    )
-    if local_branch.returncode != 0 or local_branch.stdout.strip() != branch:
+    local_branch = current_branch(root)
+    if local_branch != branch:
         ssh_command(f"rm -f {shlex.quote(remote_bundle)}", check=False)
-        die(f"branch mismatch: local={local_branch.stdout.strip() or 'detached'} remote={branch}")
+        die(f"branch mismatch: local={local_branch} remote={branch}")
     with tempfile.TemporaryDirectory(prefix="ompup-pull-bundle-") as bundle_dir:
         bundle = Path(bundle_dir) / f"{project}.bundle"
         try:
@@ -700,14 +715,25 @@ def attach(session: str, remote_dir: str, launch: str, fingerprint: str) -> None
     )
     if launch:
         create += " " + shlex.quote(f'{launch}; exec \"$SHELL\"')
+    if fingerprint:
+        existing_check = (
+            f"actual=$(tmux show-options -v -t {quoted_option_target} @ompup-environment 2>/dev/null || true); "
+            f"[ \"$actual\" = {shlex.quote(fingerprint)} ] || "
+            f"{{ printf 'tmux session environment mismatch\\n' >&2; exit 7; }}; "
+        )
+        record_environment = (
+            f"tmux set-option -t {quoted_option_target} @ompup-environment "
+            f"{shlex.quote(fingerprint)}; "
+        )
+    else:
+        existing_check = ""
+        record_environment = ""
     command = (
         f"if tmux has-session -t {quoted_target} 2>/dev/null; then "
-        f"actual=$(tmux show-options -v -t {quoted_option_target} @ompup-environment 2>/dev/null || true); "
-        f"[ \"$actual\" = {shlex.quote(fingerprint)} ] || "
-        f"{{ printf 'tmux session environment mismatch\\n' >&2; exit 7; }}; "
+        f"{existing_check}"
         f"exec tmux attach-session -t {quoted_target}; fi; "
         f"{create}; "
-        f"tmux set-option -t {quoted_option_target} @ompup-environment {shlex.quote(fingerprint)}; "
+        f"{record_environment}"
         f"exec tmux attach-session -t {quoted_target}"
     )
     os.execvp("ssh", ["ssh", "-t", REMOTE, command])
@@ -795,14 +821,26 @@ def parse_args() -> argparse.Namespace:
     return create_parser().parse_args(argv)
 
 
-def validate_local_requirements() -> None:
+def validate_local_requirements(args: argparse.Namespace) -> None:
     if not REMOTE_ROOT or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", REMOTE_ROOT):
         die("OMPUP_REMOTE_ROOT must be a relative path of safe directory names")
     if any(part in {".", ".."} for part in REMOTE_ROOT.split("/")):
         die("OMPUP_REMOTE_ROOT cannot contain . or ..")
     if os.environ.get("OMPUP_EXCLUDES"):
         die("OMPUP_EXCLUDES is no longer supported; use .gitignore or .git/info/exclude")
-    for executable in ("git", "ssh", "rsync", "gitleaks"):
+    if args.command == "hosts":
+        required = ("ssh",)
+    elif args.command in {"pin", "unpin"}:
+        required = ("git",)
+    elif args.command in {"status", "doctor"}:
+        required = ("git", "ssh")
+    elif args.command == "auth":
+        required = ("ssh", "omp")
+    elif args.command == "env":
+        required = ("ssh", "omp") if args.env_command == "status" else ("ssh", "omp", "gitleaks")
+    else:
+        required = ("git", "ssh", "rsync", "gitleaks")
+    for executable in required:
         if shutil.which(executable) is None:
             die(f"required local command not found: {executable}")
 
@@ -817,15 +855,15 @@ def host_context(
     probe_all: bool = False,
 ) -> tuple[HostChoice, list[HostProbe], str, str, str]:
     global LAUNCH, REMOTE
-    remote_dir = f"{REMOTE_ROOT}/{project}"
-    session = re.sub(r"[^a-z0-9_.:-]", "", project.lower().replace(" ", "-"))
+    session = project
     hosts = load_hosts(LEGACY_HOST)
     profile = project_profile(root, requested_profile)
     explicit = requested_host or (LEGACY_HOST if LEGACY_HOST not in {"", "auto"} else "")
     requested = explicit or pinned_host(root)
     probe_targets = hosts if probe_all or not requested else [find_host(hosts, requested)]
-    probes = probe_hosts(probe_targets, remote_dir, session)
+    probes = probe_hosts(probe_targets, project, session, REMOTE_ROOT)
     choice = choose_host(hosts, probes, root, profile, explicit)
+    remote_dir = choice.probe.remote_dir
     REMOTE = choice.host.ssh
     LAUNCH = LAUNCH_OVERRIDE or choice.host.launch
     if persist and not pinned_host(root):
@@ -854,7 +892,7 @@ def print_banner(root: Path, project: str, choice: HostChoice, profile: str) -> 
 
 def show_hosts(as_json: bool = False) -> None:
     hosts = load_hosts(LEGACY_HOST)
-    probes = probe_hosts(hosts, f"{REMOTE_ROOT}/.ompup-probe", ".ompup-probe")
+    probes = probe_hosts(hosts, ".ompup-probe", ".ompup-probe", REMOTE_ROOT)
     if as_json:
         print(
             json.dumps(
@@ -1122,65 +1160,103 @@ def run_environment_command(args: argparse.Namespace) -> None:
     hosts = load_hosts(LEGACY_HOST)
     selected = select_hosts(hosts, args.host, args.all)
     config = load_environment_config()
-    release = build_release(config.broker_url)
-    try:
-        if args.env_command == "status":
-            statuses = [environment_status(host) for host in selected]
-            if args.json:
-                print(
-                    json.dumps(
-                        {
-                            "fingerprint": release.fingerprint,
-                            "ompVersion": release.manifest["ompVersion"],
-                            "hostLocal": release.manifest["hostLocal"],
-                            "excludedExtensions": release.manifest["excludedExtensions"],
-                            "hosts": [
-                                {
-                                    "name": status.host.name,
-                                    "reachable": status.reachable,
-                                    "ok": status.ok and status.fingerprint == release.fingerprint,
-                                    "fingerprint": status.fingerprint,
-                                    "ompVersion": status.omp_version,
-                                    "mismatches": status.mismatches,
-                                    "error": status.error,
-                                }
-                                for status in statuses
-                            ],
-                        },
-                        indent=2,
-                    )
+    if config.mode == "preserve":
+        if args.env_command == "sync":
+            raise RuntimeError(
+                "environment sync is disabled in preserve mode; set environment.mode to mirror explicitly"
+            )
+        statuses = [preserved_environment_status(host) for host in selected]
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "mode": "preserve",
+                        "hosts": [
+                            {
+                                "name": status.host.name,
+                                "reachable": status.reachable,
+                                "ok": status.ok,
+                                "ompVersion": status.omp_version,
+                                "error": status.error,
+                            }
+                            for status in statuses
+                        ],
+                    },
+                    indent=2,
                 )
-            else:
-                print(f"local: {release.fingerprint[:12]} ({release.manifest['ompVersion']})")
-                for status in statuses:
-                    print(format_environment_status(status, release.fingerprint))
-                if release.manifest["excludedExtensions"]:
-                    print("host-local extensions: " + ", ".join(release.manifest["excludedExtensions"]))
-            return
+            )
+        else:
+            print("local: preserve remote OMP configuration")
+            for status in statuses:
+                print(format_environment_status(status))
+        return
 
+    token = None
+    if args.env_command == "sync" and config.broker_url:
         bootstrap_auth(hosts)
-        token_path = Path.home() / ".omp/auth-broker.token"
+        token_path = CONFIG_ROOT / "auth-broker.token"
+        if not token_path.is_file():
+            raise RuntimeError(
+                f"auth broker token is missing at {token_path}; run `ompup auth setup`"
+            )
         token = token_path.read_bytes()
-        failures: list[str] = []
-        for host in selected:
-            current = environment_status(host)
-            if (
-                current.ok
-                and current.fingerprint == release.fingerprint
-                and current.omp_version == release.manifest["ompVersion"]
-            ):
-                print(format_environment_status(current, release.fingerprint))
-                continue
-            try:
-                status = sync_environment(host, release, token)
-                print(format_environment_status(status, release.fingerprint))
-            except RuntimeError as error:
-                failures.append(f"{host.name}: {error}")
-                print(f"ompup: {host.name}: {error}", file=sys.stderr)
-        if failures:
-            raise RuntimeError(f"environment sync failed for {len(failures)} host(s)")
-    finally:
-        cleanup_release(release)
+
+    results: list[tuple[object, object]] = []
+    failures: list[str] = []
+    for host in selected:
+        release = build_release(config, host)
+        try:
+            status = environment_status(host)
+            expected_version = str(release.manifest["ompVersion"])
+            ready = (
+                status.ok
+                and status.fingerprint == release.fingerprint
+                and status.omp_version == expected_version
+            )
+            if args.env_command == "sync" and not ready:
+                try:
+                    status = sync_environment(host, release, token)
+                except RuntimeError as error:
+                    failures.append(f"{host.name}: {error}")
+                    print(f"ompup: {host.name}: {error}", file=sys.stderr)
+            results.append((release, status))
+        finally:
+            cleanup_release(release)
+    if failures:
+        raise RuntimeError(f"environment sync failed for {len(failures)} host(s)")
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "mode": "mirror",
+                    "hosts": [
+                        {
+                            "name": status.host.name,
+                            "reachable": status.reachable,
+                            "ok": status.ok and status.fingerprint == release.fingerprint,
+                            "expectedFingerprint": release.fingerprint,
+                            "fingerprint": status.fingerprint,
+                            "expectedOmpVersion": release.manifest["ompVersion"],
+                            "ompVersion": status.omp_version,
+                            "mismatches": status.mismatches,
+                            "error": status.error,
+                            "excludedExtensions": release.manifest["excludedExtensions"],
+                        }
+                        for release, status in results
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+    for release, status in results:
+        print(format_environment_status(status, release.fingerprint))
+        if release.manifest["excludedExtensions"]:
+            print(
+                f"{status.host.name} host-local extensions: "
+                + ", ".join(release.manifest["excludedExtensions"])
+            )
 
 
 def run_auth_command(args: argparse.Namespace) -> None:
@@ -1199,7 +1275,11 @@ def run_auth_command(args: argparse.Namespace) -> None:
 
 
 def verify_selected_environment(choice: HostChoice, session: str):
+    config = load_environment_config()
     status = ensure_environment(choice.host)
+    if config.mode == "preserve":
+        print(f"ompup: preserving remote OMP configuration on {choice.host.name} ({status.omp_version})")
+        return status
     print(f"ompup: environment {status.fingerprint[:12]} verified on {choice.host.name}")
     if choice.probe.session_exists:
         actual = session_environment(session)
@@ -1217,7 +1297,7 @@ def verify_selected_environment(choice: HostChoice, session: str):
 def main() -> None:
     global LAUNCH, REMOTE
     args = parse_args()
-    validate_local_requirements()
+    validate_local_requirements(args)
     try:
         if args.command == "hosts":
             show_hosts(args.json)
@@ -1263,7 +1343,7 @@ def main() -> None:
             return
         if args.command == "handoff":
             if selected_environment is None:
-                die("shared environment was not verified")
+                die("remote environment was not verified")
             handoff_session(
                 root,
                 project,

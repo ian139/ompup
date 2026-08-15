@@ -11,6 +11,19 @@ import shutil
 import subprocess
 import time
 from typing import Iterable
+TOP_LEVEL_KEYS = {"hosts", "environment"}
+HOST_KEYS = {
+    "name",
+    "ssh",
+    "roles",
+    "reserve_gb",
+    "priority",
+    "launch",
+    "remote_root",
+    "remote_agent_home",
+    "remote_config_root",
+}
+
 
 CONFIG_PATH = Path(os.environ.get("OMPUP_CONFIG", Path.home() / ".config/ompup/hosts.json")).expanduser()
 
@@ -102,7 +115,9 @@ class HostConfig:
     reserve_gb: float = 10.0
     priority: float = 0.0
     launch: str = "omp"
-
+    remote_root: str = ""
+    remote_agent_home: str = ".omp/agent"
+    remote_config_root: str = ".omp"
 
 @dataclass(frozen=True)
 class HostProbe:
@@ -121,6 +136,8 @@ class HostProbe:
     project_exists: bool = False
     session_exists: bool = False
     tools_ok: bool = False
+    remote_dir: str = ""
+
     error: str = ""
 
     @property
@@ -140,19 +157,70 @@ class HostChoice:
     score: float
 
 
-def _validate_host(raw: dict) -> HostConfig:
-    name = str(raw.get("name", "")).strip()
-    ssh = str(raw.get("ssh", "")).strip()
-    if not name or not ssh or any(char.isspace() for char in name):
-        raise HostSelectionError("each configured host needs a whitespace-free name and SSH destination")
-    roles = tuple(str(role).lower() for role in raw.get("roles", ["general"]))
+def _relative_remote_path(value: object, field: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise HostSelectionError(f"{field} must be a string")
+    path = value.strip().strip("/")
+    if not path and allow_empty:
+        return ""
+    parts = path.split("/")
+    if (
+        not path
+        or path.startswith("~")
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(not all(char.isalnum() or char in "_.-" for char in part) for part in parts)
+    ):
+        raise HostSelectionError(f"{field} must be a relative path of safe directory names")
+    return path
+
+
+def _validate_host(raw: object, index: int = 0) -> HostConfig:
+    if not isinstance(raw, dict):
+        raise HostSelectionError(f"hosts[{index}] must be an object")
+    unknown = sorted(set(raw) - HOST_KEYS)
+    if unknown:
+        raise HostSelectionError(f"hosts[{index}] has unknown field(s): {', '.join(unknown)}")
+    name = raw.get("name")
+    ssh = raw.get("ssh")
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or any(not (char.isalnum() or char in "_.-") for char in name)
+    ):
+        raise HostSelectionError(f"hosts[{index}].name must contain only letters, numbers, _, ., or -")
+    if not isinstance(ssh, str) or not ssh.strip() or any(char.isspace() for char in ssh):
+        raise HostSelectionError(f"hosts[{index}].ssh must be one nonempty SSH destination or alias")
+    raw_roles = raw.get("roles", ["general"])
+    if not isinstance(raw_roles, list) or not raw_roles or any(
+        not isinstance(role, str) or not role.strip() for role in raw_roles
+    ):
+        raise HostSelectionError(f"hosts[{index}].roles must be a nonempty array of strings")
+    try:
+        reserve_gb = float(raw.get("reserve_gb", 10))
+        priority = float(raw.get("priority", 0))
+    except (TypeError, ValueError) as error:
+        raise HostSelectionError(f"hosts[{index}] reserve_gb and priority must be numbers") from error
+    if not math.isfinite(reserve_gb) or reserve_gb < 0:
+        raise HostSelectionError(f"hosts[{index}].reserve_gb must be a finite nonnegative number")
+    if not math.isfinite(priority):
+        raise HostSelectionError(f"hosts[{index}].priority must be finite")
+    launch = raw.get("launch", "omp")
+    if not isinstance(launch, str) or not launch.strip():
+        raise HostSelectionError(f"hosts[{index}].launch must be a nonempty string")
     return HostConfig(
-        name=name,
-        ssh=ssh,
-        roles=roles or ("general",),
-        reserve_gb=float(raw.get("reserve_gb", 10)),
-        priority=float(raw.get("priority", 0)),
-        launch=str(raw.get("launch", "omp")),
+        name=name.strip(),
+        ssh=ssh.strip(),
+        roles=tuple(role.strip().lower() for role in raw_roles),
+        reserve_gb=reserve_gb,
+        priority=priority,
+        launch=launch.strip(),
+        remote_root=_relative_remote_path(raw.get("remote_root", ""), "remote_root", allow_empty=True),
+        remote_agent_home=_relative_remote_path(
+            raw.get("remote_agent_home", ".omp/agent"), "remote_agent_home"
+        ),
+        remote_config_root=_relative_remote_path(
+            raw.get("remote_config_root", ".omp"), "remote_config_root"
+        ),
     )
 
 
@@ -160,9 +228,19 @@ def load_hosts(fallback_host: str = "") -> list[HostConfig]:
     if CONFIG_PATH.is_file():
         try:
             payload = json.loads(CONFIG_PATH.read_text())
-            hosts = [_validate_host(item) for item in payload.get("hosts", [])]
         except (OSError, ValueError, TypeError) as error:
             raise HostSelectionError(f"invalid host configuration {CONFIG_PATH}: {error}") from error
+        if not isinstance(payload, dict):
+            raise HostSelectionError(f"host configuration {CONFIG_PATH} must be an object")
+        unknown = sorted(set(payload) - TOP_LEVEL_KEYS)
+        if unknown:
+            raise HostSelectionError(
+                f"host configuration has unknown top-level field(s): {', '.join(unknown)}"
+            )
+        raw_hosts = payload.get("hosts", [])
+        if not isinstance(raw_hosts, list):
+            raise HostSelectionError(f"hosts in {CONFIG_PATH} must be an array")
+        hosts = [_validate_host(item, index) for index, item in enumerate(raw_hosts)]
         if not hosts:
             raise HostSelectionError(f"no hosts configured in {CONFIG_PATH}")
         if fallback_host and fallback_host != "auto" and not any(
@@ -189,6 +267,11 @@ def find_host(hosts: Iterable[HostConfig], value: str) -> HostConfig:
     return matches[0]
 
 
+def remote_project_dir(host: HostConfig, project: str, default_root: str) -> str:
+    root = host.remote_root or default_root
+    return f"{root}/{project}"
+
+
 def probe_host(host: HostConfig, remote_dir: str, session: str, timeout: int = 10) -> HostProbe:
     command = "python3 - " + " ".join(
         shlex.quote(value) for value in (remote_dir, session, host.launch)
@@ -203,23 +286,54 @@ def probe_host(host: HostConfig, remote_dir: str, session: str, timeout: int = 1
             timeout=timeout + 5,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        return HostProbe(host=host, reachable=False, latency_ms=(time.monotonic() - started) * 1000, error=str(error))
+        return HostProbe(
+            host=host,
+            reachable=False,
+            latency_ms=(time.monotonic() - started) * 1000,
+            remote_dir=remote_dir,
+            error=str(error),
+        )
     latency = (time.monotonic() - started) * 1000
     if result.returncode != 0:
         message = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"ssh exit {result.returncode}"
-        return HostProbe(host=host, reachable=False, latency_ms=latency, error=message)
+        return HostProbe(
+            host=host,
+            reachable=False,
+            latency_ms=latency,
+            remote_dir=remote_dir,
+            error=message,
+        )
     try:
         data = json.loads(result.stdout)
-        return HostProbe(host=host, reachable=True, latency_ms=latency, **data)
+        return HostProbe(host=host, reachable=True, latency_ms=latency, remote_dir=remote_dir, **data)
     except (TypeError, ValueError) as error:
-        return HostProbe(host=host, reachable=False, latency_ms=latency, error=f"invalid probe output: {error}")
+        return HostProbe(
+            host=host,
+            reachable=False,
+            latency_ms=latency,
+            remote_dir=remote_dir,
+            error=f"invalid probe output: {error}",
+        )
 
 
-def probe_hosts(hosts: Iterable[HostConfig], remote_dir: str, session: str) -> list[HostProbe]:
+def probe_hosts(
+    hosts: Iterable[HostConfig],
+    project: str,
+    session: str,
+    default_remote_root: str,
+) -> list[HostProbe]:
     host_list = list(hosts)
     results: dict[str, HostProbe] = {}
     with ThreadPoolExecutor(max_workers=min(len(host_list), 8) or 1) as executor:
-        futures = {executor.submit(probe_host, host, remote_dir, session): host for host in host_list}
+        futures = {
+            executor.submit(
+                probe_host,
+                host,
+                remote_project_dir(host, project, default_remote_root),
+                session,
+            ): host
+            for host in host_list
+        }
         for future in as_completed(futures):
             probe = future.result()
             results[probe.host.name] = probe

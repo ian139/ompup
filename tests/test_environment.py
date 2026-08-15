@@ -25,6 +25,13 @@ class EnvironmentReleaseTests(unittest.TestCase):
         self.agent.mkdir()
         self.config_root.mkdir()
         self.plugin.mkdir()
+        self.environment_config = environment.EnvironmentConfig(
+            mode="mirror",
+            broker_url="http://100.64.0.1:8765",
+            include_extensions=("portable-status.ts",),
+            exclude_skills=("private-deploy",),
+            plugins=("omp-side",),
+        )
         (self.agent / "config.yml").write_text("theme: test\n")
         (self.agent / "AGENTS.md").write_text("shared rules\n")
         (self.agent / "skills/example").mkdir(parents=True)
@@ -33,8 +40,8 @@ class EnvironmentReleaseTests(unittest.TestCase):
         (self.agent / "agents").mkdir()
         (self.agent / "agents/reviewer.md").write_text("review\n")
         (self.agent / "extensions").mkdir()
-        (self.agent / "extensions/orca-prefill.ts").write_text("export default () => {}\n")
-        (self.agent / "extensions/cmux-omp-session.ts").write_text("mac only\n")
+        (self.agent / "extensions/portable-status.ts").write_text("export default () => {}\n")
+        (self.agent / "extensions/local-only.ts").write_text("local only\n")
         (self.plugin / "package.json").write_text('{"name":"ompup","version":"test"}\n')
         plugins = self.config_root / "plugins"
         plugins.mkdir()
@@ -67,14 +74,14 @@ class EnvironmentReleaseTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_release_contains_only_declared_portable_state(self) -> None:
-        release = environment.build_release("http://100.64.0.1:8765")
+        release = environment.build_release(self.environment_config, HostConfig("box", "box"))
         try:
             targets = {entry["target"] for entry in release.manifest["targets"]}
             self.assertIn(".omp/agent/config.yml", targets)
             self.assertIn(".omp/agent/skills/example", targets)
-            self.assertIn(".omp/agent/extensions/orca-prefill.ts", targets)
-            self.assertNotIn(".omp/agent/extensions/cmux-omp-session.ts", targets)
-            self.assertIn("cmux-omp-session.ts", release.manifest["excludedExtensions"])
+            self.assertIn(".omp/agent/extensions/portable-status.ts", targets)
+            self.assertNotIn(".omp/agent/extensions/local-only.ts", targets)
+            self.assertIn("local-only.ts", release.manifest["excludedExtensions"])
             self.assertFalse((release.root / "payload/agent/skills/example/.env").exists())
             self.assertEqual(release.manifest["externalPlugins"], {"omp-side": "0.1.1"})
             self.assertTrue((release.root / "payload/plugins/ompup/package.json").is_file())
@@ -86,11 +93,11 @@ class EnvironmentReleaseTests(unittest.TestCase):
     def test_disabled_and_credential_bearing_skills_are_excluded(self) -> None:
         (self.agent / "skills/ignored").mkdir()
         (self.agent / "skills/ignored/SKILL.md").write_text("ignored\n")
-        (self.agent / "skills/website-deployment").mkdir()
-        (self.agent / "skills/website-deployment/SKILL.md").write_text("private\n")
+        (self.agent / "skills/private-deploy").mkdir()
+        (self.agent / "skills/private-deploy/SKILL.md").write_text("private\n")
         with mock.patch.object(environment, "_ignored_skills", return_value=("ignored",)):
-            excluded = environment._excluded_skill_names()
-        self.assertEqual(excluded, {"ignored", "website-deployment"})
+            excluded = environment._excluded_skill_names(self.environment_config)
+        self.assertEqual(excluded, {"ignored", "private-deploy"})
 
     def test_remote_config_removes_machine_local_extension_paths(self) -> None:
         source = self.root / "portable-config.yml"
@@ -118,15 +125,90 @@ class EnvironmentReleaseTests(unittest.TestCase):
 
 
     def test_fingerprint_changes_with_shared_skill_content(self) -> None:
-        first = environment.build_release("http://100.64.0.1:8765")
+        host = HostConfig("box", "box")
+        first = environment.build_release(self.environment_config, host)
         first_fingerprint = first.fingerprint
         environment.cleanup_release(first)
         (self.agent / "skills/example/SKILL.md").write_text("changed\n")
-        second = environment.build_release("http://100.64.0.1:8765")
+        second = environment.build_release(self.environment_config, host)
         try:
             self.assertNotEqual(first_fingerprint, second.fingerprint)
         finally:
             environment.cleanup_release(second)
+
+    def test_release_targets_configured_remote_roots(self) -> None:
+        host = HostConfig(
+            "box",
+            "box",
+            remote_agent_home="custom/omp-agent",
+            remote_config_root="custom/omp",
+        )
+        release = environment.build_release(self.environment_config, host)
+        try:
+            targets = {entry["target"] for entry in release.manifest["targets"]}
+            self.assertIn("custom/omp-agent/config.yml", targets)
+            self.assertNotIn(".omp/agent/config.yml", targets)
+            self.assertEqual(
+                release.manifest["authTokenTarget"],
+                "custom/omp/auth-broker.token",
+            )
+        finally:
+            environment.cleanup_release(release)
+
+
+class EnvironmentConfigTests(unittest.TestCase):
+    def test_hosts_only_configuration_defaults_to_preserve(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            config_path = Path(temp_name) / "hosts.json"
+            config_path.write_text('{"hosts":[{"name":"box","ssh":"box"}]}\n')
+            with mock.patch.object(environment, "CONFIG_PATH", config_path):
+                config = environment.load_environment_config()
+        self.assertEqual(config.mode, "preserve")
+        self.assertFalse(config.broker_url)
+
+    def test_mirror_configuration_does_not_require_auth_broker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            config_path = Path(temp_name) / "hosts.json"
+            config_path.write_text(
+                '{"hosts":[{"name":"box","ssh":"box"}],"environment":{"mode":"mirror"}}\n'
+            )
+            with mock.patch.object(environment, "CONFIG_PATH", config_path):
+                config = environment.load_environment_config()
+        self.assertEqual(config.mode, "mirror")
+        self.assertFalse(config.auth_host)
+
+    def test_environment_rejects_unknown_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            config_path = Path(temp_name) / "hosts.json"
+            config_path.write_text('{"environment":{"mode":"preserve","pluginss":[]}}\n')
+            with (
+                mock.patch.object(environment, "CONFIG_PATH", config_path),
+                self.assertRaisesRegex(environment.HostSelectionError, "pluginss"),
+            ):
+                environment.load_environment_config()
+
+    def test_preserve_mode_checks_remote_without_building_release(self) -> None:
+        host = HostConfig("box", "box")
+        expected = environment.EnvironmentStatus(
+            host=host,
+            reachable=True,
+            ok=True,
+            omp_version="omp/current",
+            expected_omp_version="omp/current",
+        )
+        with (
+            mock.patch.object(
+                environment,
+                "load_environment_config",
+                return_value=environment.EnvironmentConfig(),
+            ),
+            mock.patch.object(environment, "preserved_environment_status", return_value=expected),
+            mock.patch.object(environment, "build_release") as build_release,
+        ):
+            actual = environment.ensure_environment(host)
+        self.assertIs(actual, expected)
+        build_release.assert_not_called()
+
 
 
 class EnvironmentTransportTests(unittest.TestCase):
@@ -156,6 +238,14 @@ class EnvironmentTransportTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertNotIn(token.decode(), " ".join(command))
         self.assertEqual(run.call_args.kwargs["input_bytes"], token)
+        self.assertIn('$HOME/.omp/auth-broker.token', command[-1])
+
+    def test_token_uses_host_specific_remote_config_root(self) -> None:
+        host = HostConfig("box", "box-ssh", remote_config_root="custom/omp")
+        completed = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.object(environment, "_run", return_value=completed) as run:
+            environment._provision_token(host, b"private-broker-token-value")
+        self.assertIn('$HOME/custom/omp/auth-broker.token', run.call_args.args[0][-1])
 
     def test_configure_local_broker_backs_up_changed_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:

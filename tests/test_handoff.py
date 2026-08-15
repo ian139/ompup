@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+import io
 import importlib.machinery
 import importlib.util
 from pathlib import Path
@@ -64,6 +66,20 @@ class HandoffContractTests(unittest.TestCase):
         self.assertEqual(args.command, "auth")
         self.assertEqual(args.auth_command, "migrate")
         self.assertTrue(args.dry_run)
+
+    def test_preserve_mode_refuses_environment_sync(self) -> None:
+        args = SimpleNamespace(env_command="sync", host=[], all=False)
+        host = SimpleNamespace(name="compute")
+        with (
+            patch.object(CLI, "load_hosts", return_value=[host]),
+            patch.object(
+                CLI,
+                "load_environment_config",
+                return_value=SimpleNamespace(mode="preserve"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "preserve mode"),
+        ):
+            CLI.run_environment_command(args)
     def test_environment_gate_rejects_unversioned_remote_session(self) -> None:
         choice = SimpleNamespace(
             host=SimpleNamespace(name="compute"),
@@ -71,11 +87,35 @@ class HandoffContractTests(unittest.TestCase):
         )
         status = SimpleNamespace(fingerprint="a" * 64)
         with (
+            patch.object(
+                CLI,
+                "load_environment_config",
+                return_value=SimpleNamespace(mode="mirror"),
+            ),
             patch.object(CLI, "ensure_environment", return_value=status),
             patch.object(CLI, "session_environment", return_value=""),
             self.assertRaises(SystemExit),
         ):
             CLI.verify_selected_environment(choice, "project")
+    def test_preserve_mode_accepts_an_existing_unmanaged_session(self) -> None:
+        choice = SimpleNamespace(
+            host=SimpleNamespace(name="compute"),
+            probe=SimpleNamespace(session_exists=True),
+        )
+        status = SimpleNamespace(fingerprint="", omp_version="omp/current")
+        with (
+            patch.object(
+                CLI,
+                "load_environment_config",
+                return_value=SimpleNamespace(mode="preserve"),
+            ),
+            patch.object(CLI, "ensure_environment", return_value=status),
+            patch.object(CLI, "session_environment") as session_environment,
+        ):
+            actual = CLI.verify_selected_environment(choice, "project")
+        self.assertIs(actual, status)
+        session_environment.assert_not_called()
+
 
     def test_attach_records_environment_fingerprint_in_tmux(self) -> None:
         with patch.object(CLI.os, "execvp") as execvp:
@@ -85,6 +125,60 @@ class HandoffContractTests(unittest.TestCase):
         remote_command = execvp.call_args.args[1][-1]
         self.assertIn("@ompup-environment", remote_command)
         self.assertIn("b" * 64, remote_command)
+    def test_attach_preserve_mode_does_not_require_environment_metadata(self) -> None:
+        with patch.object(CLI.os, "execvp") as execvp:
+            CLI.REMOTE = "compute-box"
+            CLI.attach("Project", "Projects/Project", "omp", "")
+        remote_command = execvp.call_args.args[1][-1]
+        self.assertNotIn("@ompup-environment", remote_command)
+
+    def test_detached_head_has_actionable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            CLI.run(["git", "init", "-q", str(root)])
+            (root / "file.txt").write_text("content\n")
+            CLI.run(["git", "-C", str(root), "add", "file.txt"])
+            CLI.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "initial",
+                ]
+            )
+            head = CLI.git(root, "rev-parse", "HEAD")
+            CLI.run(["git", "-C", str(root), "checkout", "-q", "--detach", head])
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                CLI.current_branch(root)
+            self.assertIn("check out a local branch", stderr.getvalue())
+    def test_credential_query_is_not_copied_as_remote_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            CLI.run(["git", "init", "-q", str(root)])
+            CLI.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/repo.git?access_token=private",
+                ]
+            )
+            _identity, remote_origin = CLI.project_identity(root)
+        self.assertEqual(remote_origin, "")
+
+
 
 
 

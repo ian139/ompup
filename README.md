@@ -2,7 +2,7 @@
 
 Jump from any local project into a persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) session on the best available remote machine.
 
-ompup probes configured hosts, honors project and workload affinity, pins the first placement, aligns the shared OMP environment, transfers Git commits and uncommitted state safely, attaches a project-named tmux session, and launches `omp`. The `/ompup handoff` extension command also moves the current live conversation into remote tmux and replaces its cmux surface in place.
+ompup probes configured hosts, honors project and workload affinity, pins the first placement, transfers Git commits and uncommitted state safely, attaches a project-named tmux session, and launches `omp`. Remote OMP configuration is preserved by default. An explicit `environment.mode: "mirror"` opt-in can align selected configuration, skills, extensions, plugins, authentication, and OMP versions. The `/ompup handoff` extension command also moves the current live conversation into remote tmux and replaces its cmux surface in place.
 
 ```bash
 ompup                       # current Git project
@@ -10,9 +10,9 @@ ompup UFC-pokedex           # named project from any directory
 ompup --pick                # interactive project picker
 ompup --cmux                # open or reuse a cmux workspace
 /ompup handoff              # from inside local omp running in cmux
-ompup env status --all      # verify OMP config, skills, agents, extensions, and plugins
-ompup env sync --all        # align every reachable machine
-ompup auth status           # verify the shared credential broker
+ompup env status --all      # inspect remote OMP without changing it
+ompup env sync --all        # mirror mode only: align every reachable machine
+ompup auth status           # optional: verify a configured credential broker
 ```
 
 ## How it works
@@ -33,12 +33,12 @@ local session JSONL + artifacts ──────────────> ~/.l
 - An existing tmux session is reattached without synchronizing files beneath the running process. Use `ompup sync` explicitly when you want a later local change transferred.
 - Host selection is sticky. Live capacity chooses the first placement; the project remains pinned until `ompup unpin`.
 - A live handoff waits for OMP to become idle, syncs the project, copies the session and artifacts into a private remote state directory, verifies the checksum and remote export, and starts OMP in tmux. Only then does cmux replace the local surface.
-- Before an OMP launch or live handoff, the selected machine must match the local environment fingerprint and OMP version. Each tmux session records the fingerprint it started with, so an older live process cannot be mistaken for a current environment.
+- In `mirror` mode, an OMP launch or live handoff requires the selected machine to match the generated environment fingerprint and OMP version. Each managed tmux session records the fingerprint it started with. In the default `preserve` mode, ompup verifies that remote OMP launches but does not read or change its configuration.
 
 ## Requirements
 
-- Local: Python 3.12 or newer, `ssh`, `rsync`, `git`, `gitleaks`, and `yq`; cmux is required for live session handoff
-- Remote: Python 3, Bash, `tmux`, `rsync`, `git`, and `omp`
+- Local: Python 3.12 or newer, `ssh`, `rsync`, `git`, and `gitleaks`; mirror mode also requires Mike Farah `yq` v4; cmux is required for live session handoff
+- Remote: Python 3.7 or newer, Bash, `tmux`, `rsync`, `git`, and `omp`
 - An SSH host or alias that reaches your box (an entry in `~/.ssh/config` works well)
 
 ## Install
@@ -117,12 +117,14 @@ Create `~/.config/ompup/hosts.json`:
       "roles": ["general", "macos", "arm64"],
       "reserve_gb": 25,
       "priority": 0,
+      "remote_root": "Projects",
+      "remote_agent_home": ".omp/agent",
+      "remote_config_root": ".omp",
       "launch": "$HOME/.local/bin/omp"
     }
   ],
   "environment": {
-    "auth_host": "compute",
-    "auth_broker_url": "http://100.64.0.10:8765"
+    "mode": "preserve"
   }
 }
 ```
@@ -139,30 +141,46 @@ Selection precedence:
 
 The capacity score uses declared roles, minimum free-space reserves, free disk, normalized load, available memory, and optional priority. It is a placement heuristic, not a hardware benchmark. Common profiles are `general`, `linux`, `storage`, `macos`, and `services`; custom role names work without source changes. Swift and Xcode projects select `macos` automatically. Set a persistent override with `git config ompup.profile PROFILE`.
 
-## Shared OMP environment
+## OMP environment modes
 
-`ompup env sync` treats the local Mac as the declarative source and installs a content-addressed release on each reachable host. Existing remote files are moved into timestamped backups before replacement. The release and every transferred project snapshot are scanned with `gitleaks`.
+The default mode is `preserve`. It checks that the selected host can launch OMP, then leaves that host's configuration, plugins, extensions, credentials, and installed version untouched. A hosts-only configuration therefore works without an auth broker:
 
-| Shared and parity-gated | Intentionally machine-local |
-|---|---|
-| OMP version and safe `config.yml` settings | `agent.db`, session history, memories, caches, blobs, logs |
-| Active skills, agents, commands, rules, hooks, and referenced OMP docs | `.env`, broker tokens, API credentials, and other secret files |
-| Portable extensions and exact linked plugin sources | MCP definitions, custom model files, SSH configuration |
-| Auth-broker URL and model-role settings | cmux, Pompup, IRC visualization, and local episodic-memory extensions |
+```json
+{
+  "hosts": [{"name": "compute", "ssh": "compute-box"}]
+}
+```
 
-Remote configuration removes local extension paths and disables speech, sonification, and computer control. Skills ignored by the local OMP configuration, large local runtime payloads, and known credential-bearing skill payloads remain local. Authentication uses the OMP auth broker instead of copying SQLite databases or refresh tokens. The bearer token is transferred only through SSH stdin and stored as `~/.omp/auth-broker.token` with mode `0600`.
+Set `environment.mode` to `mirror` only when the local machine should manage remote OMP state:
 
-Initial rollout:
+```json
+{
+  "environment": {
+    "mode": "mirror",
+    "include_extensions": ["portable-status.ts"],
+    "exclude_skills": ["private-*"],
+    "plugins": ["portable-plugin"],
+    "auth_host": "compute",
+    "auth_broker_url": "https://broker.example.internal"
+  }
+}
+```
+
+Mirror mode installs a content-addressed release on each selected host. Existing target files move into timestamped backups before replacement. Only explicitly listed extensions and plugins transfer. Skills ignored by local OMP or matched by `exclude_skills` remain local. Common credential files, machine-local state, sessions, memories, caches, databases, MCP definitions, and model files remain local. Every release and project snapshot is scanned with `gitleaks`.
+
+The broker fields are optional and must be configured together. When present, `ompup auth setup` retrieves the token over SSH and stores it under the configured OMP root with mode `0600`. The broker URL should be reachable only through a trusted private network or TLS.
+
+Each host may override `remote_root`, `remote_agent_home`, and `remote_config_root`. All three are safe relative paths below remote `$HOME`. Environment policy is declarative; no extension, plugin, or skill name is hardcoded as portable.
+
+Mirror rollout:
 
 ```bash
-ompup auth setup
-ompup auth migrate --dry-run
+ompup auth setup             # only when broker fields are configured
+ompup auth migrate --dry-run # optional broker migration
 ompup auth migrate
 ompup env sync --all
 ompup env status --all
 ```
-
-The broker URL should be reachable only through a trusted network such as Tailscale or through TLS. `env sync` skips nothing silently: unreachable hosts and version, fingerprint, plugin, or checksum failures are reported.
 
 ## Environment
 
@@ -174,6 +192,8 @@ The broker URL should be reachable only through a trusted network such as Tailsc
 | `OMPUP_REMOTE_ROOT` | `Projects` | Directory under remote `$HOME` for checkouts |
 | `OMPUP_CMD` | host `launch` value | One-invocation remote OMP command override |
 | `OMPUP_EXCLUDES` | unsupported | Use `.gitignore` or `.git/info/exclude` |
+| `OMPUP_AGENT_HOME` | `~/.omp/agent` | Local OMP agent configuration source used by mirror mode |
+| `PI_CONFIG_DIR` | `~/.omp` | Local OMP configuration root and broker-token location |
 
 ## Notes
 

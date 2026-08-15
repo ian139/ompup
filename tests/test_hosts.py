@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ompup import hosts as hosts_module  # noqa: E402
 from ompup.hosts import (  # noqa: E402
     HostConfig,
     HostProbe,
     HostSelectionError,
     choose_host,
+    load_hosts,
     pin_host,
+    probe_hosts,
+    remote_project_dir,
 )
 
 
@@ -125,6 +131,42 @@ class HostSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(HostSelectionError, "multiple hosts"):
             choose_host(self.hosts, probes, self.root, "general")
 
+    def test_host_roles_must_be_an_array(self) -> None:
+        config = self.root / "hosts.json"
+        config.write_text(json.dumps({"hosts": [{"name": "box", "ssh": "box", "roles": "linux"}]}))
+        with (
+            mock.patch.object(hosts_module, "CONFIG_PATH", config),
+            self.assertRaisesRegex(HostSelectionError, "roles must be"),
+        ):
+            load_hosts()
+
+    def test_unknown_host_fields_are_rejected(self) -> None:
+        config = self.root / "hosts.json"
+        config.write_text(json.dumps({"hosts": [{"name": "box", "ssh": "box", "reserveGB": 10}]}))
+        with (
+            mock.patch.object(hosts_module, "CONFIG_PATH", config),
+            self.assertRaisesRegex(HostSelectionError, "reserveGB"),
+        ):
+            load_hosts()
+
+    def test_host_specific_remote_root_is_used(self) -> None:
+        host = HostConfig("box", "box", remote_root="srv/projects")
+        self.assertEqual(remote_project_dir(host, "Project", "Projects"), "srv/projects/Project")
+    def test_probe_hosts_uses_each_hosts_remote_root(self) -> None:
+        hosts = [
+            HostConfig("default", "default"),
+            HostConfig("custom", "custom", remote_root="srv/projects"),
+        ]
+
+        def fake_probe(host: HostConfig, remote_dir: str, _session: str) -> HostProbe:
+            return HostProbe(host, True, 1, remote_dir=remote_dir)
+
+        with mock.patch.object(hosts_module, "probe_host", side_effect=fake_probe):
+            probes = probe_hosts(hosts, "Project", "Project", "Projects")
+        self.assertEqual(
+            [probe.remote_dir for probe in probes],
+            ["Projects/Project", "srv/projects/Project"],
+        )
 
 if __name__ == "__main__":
     unittest.main()

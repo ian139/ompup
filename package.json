@@ -10,6 +10,13 @@
   "bin": {
     "ompup": "./bin/ompup"
   },
+  "files": [
+    "bin/ompup",
+    "src/ompup/*.py",
+    "extension/index.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "python3 -m unittest discover -s tests -v && bun test tests/extension.test.ts"
   },
