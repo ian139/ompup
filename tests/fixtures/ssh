@@ -17,10 +17,25 @@ host=$1; shift
 [ "$#" -gt 0 ] || exit 0
 cmd=$1; shift
 while [ "$#" -gt 0 ]; do cmd="$cmd $1"; shift; done
+after_fail=0
+if [ -n "${OMPUP_FAKE_SSH_FAIL_AFTER_MATCH:-}" ]; then
+  case "$cmd" in *"$OMPUP_FAKE_SSH_FAIL_AFTER_MATCH"*) after_fail=1 ;; esac
+fi
+if [ -n "${OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH:-}" ] && [ -n "${OMPUP_FAKE_SSH_MUTATE_PATH:-}" ]; then
+  case "$cmd" in
+    *"$OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH"*)
+      mkdir -p "$(dirname "$OMPUP_FAKE_SSH_MUTATE_PATH")"
+      printf 'concurrent\n' > "$OMPUP_FAKE_SSH_MUTATE_PATH" ;;
+  esac
+fi
 if [ -n "${OMPUP_FAKE_SSH_FAIL_MATCH:-}" ]; then
   case "$cmd" in *"$OMPUP_FAKE_SSH_FAIL_MATCH"*) echo "fixture matched failure" >&2; exit 255 ;; esac
 fi
 [ -z "${OMPUP_FAKE_SSH_LOG:-}" ] || printf '%s\n' "$cmd" >> "$OMPUP_FAKE_SSH_LOG"
 cd "$OMPUP_FAKE_REMOTE_HOME"
 HOME=$OMPUP_FAKE_REMOTE_HOME export HOME
-exec /bin/bash -c "$cmd"
+unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP
+/bin/bash -c "$cmd"
+rc=$?
+[ "$after_fail" -eq 0 ] || { echo "fixture failed after matched command" >&2; exit 255; }
+exit "$rc"
