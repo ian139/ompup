@@ -1,5 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, openSync, closeSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  fchmodSync,
+  mkdtempSync,
+  openSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,95 +17,264 @@ import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 
 const VERBS = ["sync", "pull", "status"] as const;
-type Verb = (typeof VERBS)[number];
-const TAIL_LIMIT = 1600;
-const LONG_OUTPUT_LIMIT = 6000;
+export type Verb = (typeof VERBS)[number];
+const TAIL_LIMIT = 1_600;
+const MAX_TIMER_MS = 2_147_483_647;
+const DEFAULT_TERMINATION_GRACE_MS = 2_000;
+const BUNDLED_CLI = fileURLToPath(new URL("../bin/ompup", import.meta.url));
+
+type NotificationSeverity = "info" | "error";
+
+export interface CapturedOutput {
+  outputTail: string;
+  stdoutTail: string;
+  stderrTail: string;
+  outputTruncated: boolean;
+  stdoutBytes: number;
+  stderrBytes: number;
+  artifactPath?: string;
+}
 
 export type RunOutcome =
-  | { kind: "exit"; code: number; stdout: string; stderr: string }
-  | { kind: "timeout"; stdout: string; stderr: string }
-  | { kind: "signal"; signal: NodeJS.Signals | null; stdout: string; stderr: string }
-  | { kind: "enoent"; error: Error; stdout: string; stderr: string }
-  | { kind: "spawn-error"; error: Error; stdout: string; stderr: string };
+  | ({ kind: "exit"; code: number } & CapturedOutput)
+  | ({ kind: "timeout" } & CapturedOutput)
+  | ({ kind: "signal"; signal: NodeJS.Signals } & CapturedOutput)
+  | ({ kind: "enoent"; error: Error } & CapturedOutput)
+  | ({ kind: "spawn-error"; error: Error } & CapturedOutput);
 
 export type Runner = (bin: string, verb: Verb, cwd: string, timeoutMs: number) => Promise<RunOutcome>;
 
-function cliPath(): string {
-  const bundled = fileURLToPath(new URL("../bin/ompup", import.meta.url));
-  return existsSync(bundled) ? bundled : "ompup";
+export interface HandlerDependencies {
+  runner?: Runner;
+  resolveBinary?: () => string;
+  environment?: Readonly<Record<string, string | undefined>>;
 }
 
-function envTimeout(name: string, fallback: number): number {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+interface OutputSpool {
+  readonly dir: string;
+  readonly path: string;
+  readonly fd: number;
+  outputTail: string;
+  stdoutTail: string;
+  stderrTail: string;
+  outputTruncated: boolean;
+  stdoutBytes: number;
+  stderrBytes: number;
 }
 
-export const defaultRunner: Runner = (bin, verb, cwd, timeoutMs) =>
-  new Promise((resolve) => {
+interface RunnerOptions {
+  terminationGraceMs?: number;
+}
+
+export function resolveCliPath(
+  fileExists: (path: string) => boolean = existsSync,
+  bundledPath = BUNDLED_CLI,
+): string {
+  return fileExists(bundledPath) ? bundledPath : "ompup";
+}
+
+export function parseTimeout(value: string | undefined, fallback: number): number {
+  if (value === undefined || !/^\d+$/.test(value)) return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= MAX_TIMER_MS ? parsed : fallback;
+}
+
+export function getArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+  if (/\s/.test(prefix)) return null;
+  const query = prefix.toLowerCase();
+  const items = VERBS.filter((verb) => verb.startsWith(query)).map((verb) => ({ label: verb, value: verb }));
+  return items.length === 0 ? null : items;
+}
+
+function createSpool(): OutputSpool {
+  const dir = mkdtempSync(join(tmpdir(), "ompup-"));
+  chmodSync(dir, 0o700);
+  const path = join(dir, "output.log");
+  const fd = openSync(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  fchmodSync(fd, 0o600);
+  writeAll(fd, Buffer.from("ompup-output-v1\n"));
+  return {
+    dir,
+    path,
+    fd,
+    outputTail: "",
+    stdoutTail: "",
+    stderrTail: "",
+    outputTruncated: false,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+  };
+}
+
+function writeAll(fd: number, bytes: Buffer): void {
+  let offset = 0;
+  while (offset < bytes.byteLength) offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
+}
+
+function boundedAppend(current: string, addition: string): { value: string; truncated: boolean } {
+  if (addition.length >= TAIL_LIMIT) {
+    return { value: addition.slice(-TAIL_LIMIT), truncated: current.length > 0 || addition.length > TAIL_LIMIT };
+  }
+  const combined = current + addition;
+  return combined.length > TAIL_LIMIT
+    ? { value: combined.slice(-TAIL_LIMIT), truncated: true }
+    : { value: combined, truncated: false };
+}
+
+function capture(spool: OutputSpool, stream: "stdout" | "stderr", chunk: Buffer): void {
+  const header = Buffer.from(`\n[${stream} ${chunk.byteLength} bytes]\n`);
+  writeAll(spool.fd, header);
+  writeAll(spool.fd, chunk);
+
+  const text = chunk.toString("utf8");
+  const ordered = boundedAppend(spool.outputTail, `\n[${stream}]\n${text}`);
+  spool.outputTail = ordered.value;
+  spool.outputTruncated ||= ordered.truncated;
+  if (stream === "stdout") {
+    spool.stdoutBytes += chunk.byteLength;
+    spool.stdoutTail = boundedAppend(spool.stdoutTail, text).value;
+  } else {
+    spool.stderrBytes += chunk.byteLength;
+    spool.stderrTail = boundedAppend(spool.stderrTail, text).value;
+  }
+}
+
+function finishSpool(spool: OutputSpool, keep: boolean): CapturedOutput {
+  closeSync(spool.fd);
+  const output: CapturedOutput = {
+    outputTail: spool.outputTail,
+    stdoutTail: spool.stdoutTail,
+    stderrTail: spool.stderrTail,
+    outputTruncated: spool.outputTruncated,
+    stdoutBytes: spool.stdoutBytes,
+    stderrBytes: spool.stderrBytes,
+  };
+  if (keep) output.artifactPath = spool.path;
+  else rmSync(spool.dir, { recursive: true, force: true });
+  return output;
+}
+
+function signalProcessGroup(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill(signal);
+  }
+}
+
+export async function defaultRunner(
+  bin: string,
+  verb: Verb,
+  cwd: string,
+  timeoutMs: number,
+  options: RunnerOptions = {},
+): Promise<RunOutcome> {
+  const spool = createSpool();
+  const terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+
+  return await new Promise<RunOutcome>((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = spawn(bin, [verb], { cwd, shell: false });
+      child = spawn(bin, [verb], { cwd, detached: true, shell: false });
     } catch (error) {
-      resolve({ kind: "spawn-error", error: error as Error, stdout: "", stderr: "" });
+      resolve({ kind: "spawn-error", error: error as Error, ...finishSpool(spool, true) });
       return;
     }
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+
+    child.stdout.on("data", (chunk: Buffer) => capture(spool, "stdout", chunk));
+    child.stderr.on("data", (chunk: Buffer) => capture(spool, "stderr", chunk));
+
+    let spawnError: NodeJS.ErrnoException | undefined;
+    let timedOut = false;
     let settled = false;
-    const finish = (outcome: RunOutcome) => { if (!settled) { settled = true; clearTimeout(timer); resolve(outcome); } };
-    const timer = setTimeout(() => { child.kill("SIGTERM"); finish({ kind: "timeout", stdout, stderr }); }, timeoutMs);
-    child.once("error", (error: NodeJS.ErrnoException) => finish({ kind: error.code === "ENOENT" ? "enoent" : "spawn-error", error, stdout, stderr }));
+    let escalation: NodeJS.Timeout | undefined;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      signalProcessGroup(child, "SIGTERM");
+      escalation = setTimeout(() => signalProcessGroup(child, "SIGKILL"), terminationGraceMs);
+    }, timeoutMs);
+
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      spawnError = error;
+    });
     child.once("close", (code, signal) => {
-      if (signal) finish({ kind: "signal", signal, stdout, stderr });
-      else finish({ kind: "exit", code: code ?? 1, stdout, stderr });
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      clearTimeout(escalation);
+      try {
+        if (spawnError !== undefined) {
+          const kind = spawnError.code === "ENOENT" ? "enoent" : "spawn-error";
+          resolve({ kind, error: spawnError, ...finishSpool(spool, true) });
+        } else if (timedOut) {
+          resolve({ kind: "timeout", ...finishSpool(spool, true) });
+        } else if (signal !== null) {
+          resolve({ kind: "signal", signal, ...finishSpool(spool, true) });
+        } else {
+          const exitCode = code ?? 1;
+          const keep = exitCode !== 0 || spool.outputTruncated;
+          resolve({ kind: "exit", code: exitCode, ...finishSpool(spool, keep) });
+        }
+      } catch (error) {
+        reject(error);
+      }
     });
   });
-
-function tail(text: string): string {
-  const trimmed = text.trim();
-  return trimmed.length > TAIL_LIMIT ? `…${trimmed.slice(-TAIL_LIMIT)}` : trimmed;
 }
 
-function failureLog(output: string): string | undefined {
-  if (output.length <= LONG_OUTPUT_LIMIT) return undefined;
-  const dir = join(tmpdir(), "ompup");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, `failure-${Date.now()}-${process.pid}.log`);
-  const fd = openSync(path, "w", 0o600);
-  try { writeFileSync(fd, output, { encoding: "utf8" }); } finally { closeSync(fd); }
-  return path;
+export function summarize(verb: Verb, outcome: RunOutcome): { message: string; severity: NotificationSeverity } {
+  const detail = outcome.outputTail.trim();
+  const displayed = detail ? `\n${outcome.outputTruncated ? "…" : ""}${detail}` : "";
+  const artifact = outcome.artifactPath ? `\nFull output: ${outcome.artifactPath}` : "";
+  if (outcome.kind === "exit") {
+    return {
+      severity: outcome.code === 0 ? "info" : "error",
+      message: `ompup ${verb}: ${outcome.code === 0 ? "succeeded" : `exited with code ${outcome.code}`}${displayed}${artifact}`,
+    };
+  }
+  if (outcome.kind === "timeout") return { severity: "error", message: `ompup ${verb}: timed out${displayed}${artifact}` };
+  if (outcome.kind === "signal") return { severity: "error", message: `ompup ${verb}: terminated by ${outcome.signal}${displayed}${artifact}` };
+  if (outcome.kind === "enoent") return { severity: "error", message: `ompup ${verb}: executable not found (${outcome.error.message})${displayed}${artifact}` };
+  return { severity: "error", message: `ompup ${verb}: failed to start (${outcome.error.message})${displayed}${artifact}` };
 }
 
-function summarize(verb: Verb, outcome: RunOutcome): { message: string; ok: boolean } {
-  const output = `${outcome.stdout}${outcome.stderr}`;
-  const detail = tail(output);
-  const log = outcome.kind === "exit" && outcome.code === 0 ? undefined : failureLog(output);
-  const suffix = log ? ` Full output: ${log}` : "";
-  if (outcome.kind === "exit") return { ok: outcome.code === 0, message: `ompup ${verb}: ${outcome.code === 0 ? "succeeded" : `exited with code ${outcome.code}`}${detail ? `\n${detail}` : ""}${suffix}` };
-  if (outcome.kind === "timeout") return { ok: false, message: `ompup ${verb}: timed out${detail ? `\n${detail}` : ""}${suffix}` };
-  if (outcome.kind === "signal") return { ok: false, message: `ompup ${verb}: terminated by ${outcome.signal ?? "signal"}${detail ? `\n${detail}` : ""}${suffix}` };
-  if (outcome.kind === "enoent") return { ok: false, message: `ompup ${verb}: executable not found (${outcome.error.message})${suffix}` };
-  return { ok: false, message: `ompup ${verb}: failed to start (${outcome.error.message})${suffix}` };
-}
-
-function parse(args: string): Verb | "invalid" {
+function parseVerb(args: string): Verb | undefined {
   const tokens = args.trim() ? args.trim().split(/\s+/) : ["status"];
-  return tokens.length === 1 && (VERBS as readonly string[]).includes(tokens[0]) ? tokens[0] as Verb : "invalid";
+  return tokens.length === 1 && (VERBS as readonly string[]).includes(tokens[0]) ? tokens[0] as Verb : undefined;
 }
 
-export function createHandler(runner: Runner = defaultRunner) {
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function createHandler(dependencies: HandlerDependencies = {}) {
+  const runner = dependencies.runner ?? defaultRunner;
+  const resolveBinary = dependencies.resolveBinary ?? resolveCliPath;
+  const environment = dependencies.environment ?? process.env;
   return async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
-    const verb = parse(args);
-    if (verb === "invalid") { ctx.ui.notify("Usage: /ompup [sync|pull|status]", "error"); return; }
-    if (verb !== "status" && !ctx.hasUI) { ctx.ui.notify("ompup sync/pull require an interactive UI", "error"); return; }
-    const timeout = envTimeout(verb === "status" ? "OMPUP_STATUS_TIMEOUT_MS" : "OMPUP_OPERATION_TIMEOUT_MS", verb === "status" ? 30_000 : 120_000);
+    const verb = parseVerb(args);
+    if (verb === undefined) {
+      ctx.ui.notify("Usage: /ompup [sync|pull|status]", "error");
+      return;
+    }
+    if (verb !== "status" && !ctx.hasUI) {
+      ctx.ui.notify(`ompup ${verb} requires an interactive UI`, "error");
+      return;
+    }
+    const timeoutName = verb === "status" ? "OMPUP_STATUS_TIMEOUT_MS" : "OMPUP_OPERATION_TIMEOUT_MS";
+    const timeout = parseTimeout(environment[timeoutName], verb === "status" ? 30_000 : 120_000);
     ctx.ui.setStatus("ompup", `${verb}…`);
     ctx.ui.setWorkingMessage(`ompup ${verb}…`);
     try {
-      const result = summarize(verb, await runner(cliPath(), verb, ctx.cwd, timeout));
-      ctx.ui.notify(result.message, result.ok ? "info" : "error");
+      const result = summarize(verb, await runner(resolveBinary(), verb, ctx.cwd, timeout));
+      ctx.ui.notify(result.message, result.severity);
+    } catch (error) {
+      ctx.ui.notify(`ompup ${verb}: runner failed (${errorMessage(error)})`, "error");
     } finally {
       ctx.ui.setStatus("ompup", undefined);
       ctx.ui.setWorkingMessage();
@@ -107,12 +286,7 @@ export default function ompup(pi: ExtensionAPI) {
   pi.setLabel("ompup");
   pi.registerCommand("ompup", {
     description: "Sync, pull, or inspect this project (sync|pull|status)",
-    getArgumentCompletions(prefix: string): AutocompleteItem[] | null {
-      if (prefix.includes(" ")) return null;
-      const q = prefix.trim().toLowerCase();
-      const items = VERBS.filter((verb) => verb.startsWith(q)).map((verb) => ({ label: verb, value: verb }));
-      return items.length ? items : null;
-    },
+    getArgumentCompletions,
     handler: createHandler(),
   });
 }
