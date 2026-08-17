@@ -103,7 +103,8 @@ require_plain OMPUP_EXCLUDES "${OMPUP_EXCLUDES:-}"
 need git
 need ssh
 need rsync
-STATE_BASE="${XDG_STATE_HOME:-$HOME/.local/state}/ompup"
+STATE_ANCHOR=${XDG_STATE_HOME:-$HOME/.local/state}
+STATE_BASE="$STATE_ANCHOR/ompup"
 
 valid_epoch() {
   local value=$1
@@ -186,6 +187,55 @@ ssh_read() {
 ssh_write() {
   local script=$1 data=$2
   printf '%s' "$data" | ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "bash -c $(sq "$script")"
+}
+
+# Remote managed directories are built one component at a time. Existing
+# symlinks or non-directories fail closed instead of being followed by
+# mkdir -p, writes, or later recursive cleanup.
+remote_safe_dir_prelude() {
+  cat <<'EOF'
+safe_dir() {
+  managed_path=$1
+  case "$managed_path" in ''|/*) echo "unsafe managed directory: $managed_path" >&2; exit 2 ;; esac
+  managed_oldifs=$IFS
+  IFS=/
+  set -- $managed_path
+  IFS=$managed_oldifs
+  managed_current=
+  for managed_component in "$@"; do
+    [ -n "$managed_component" ] && [ "$managed_component" != . ] && [ "$managed_component" != .. ] ||
+      { echo "unsafe managed directory component" >&2; exit 2; }
+    managed_current=${managed_current:+$managed_current/}$managed_component
+    [ ! -L "$managed_current" ] || { echo "managed directory is a symlink: $managed_current" >&2; exit 2; }
+    if [ -e "$managed_current" ]; then
+      [ -d "$managed_current" ] || { echo "managed path is not a directory: $managed_current" >&2; exit 2; }
+    else
+      mkdir "$managed_current" || exit 2
+      [ -d "$managed_current" ] && [ ! -L "$managed_current" ] ||
+        { echo "could not safely create managed directory: $managed_current" >&2; exit 2; }
+    fi
+  done
+}
+require_dir() {
+  managed_path=$1
+  case "$managed_path" in ''|/*) echo "unsafe managed directory: $managed_path" >&2; exit 2 ;; esac
+  managed_oldifs=$IFS
+  IFS=/
+  set -- $managed_path
+  IFS=$managed_oldifs
+  managed_current=
+  for managed_component in "$@"; do
+    managed_current=${managed_current:+$managed_current/}$managed_component
+    [ -d "$managed_current" ] && [ ! -L "$managed_current" ] ||
+      { echo "managed directory is missing or unsafe: $managed_current" >&2; exit 2; }
+  done
+}
+EOF
+}
+
+remote_control_dirs_script() {
+  printf '%s\nsafe_dir %s\nsafe_dir %s\nsafe_dir %s\n' \
+    "$(remote_safe_dir_prelude)" "$(sq "$REMOTE_ROOT")" "$(sq "$REMOTE_ROOT/.ompup-v2")" "$(sq "$REMOTE_CONTROL")"
 }
 
 # Context-free, domain-separated SHA-1. GIT_DIR prevents ambient repository
@@ -381,6 +431,10 @@ require_local_path_git_match() {
   [ "$mode/$branch/$oid" = "$GIT_MODE/$GIT_BRANCH/$GIT_OID" ] || die "local candidate Git tuple changed"
 }
 
+require_live_local_git_tuple() {
+  require_local_path_git_match "$LOCAL_INSPECT_ROOT"
+}
+
 remote_git_tuple_script() {
   local dir=$1
   cat <<EOF
@@ -462,6 +516,56 @@ next_epoch() {
   printf '%s' $((1 + $1))
 }
 
+validate_existing_local_dir_chain() {
+  local path=$1 parent
+  if [ "$path" = "$STATE_ANCHOR" ]; then
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      [ -d "$path" ] && [ ! -L "$path" ] || die "managed local directory is unsafe: $path"
+    fi
+    return 0
+  fi
+  case "$path/" in "$STATE_ANCHOR/"*) ;; *) die "managed local path escapes the state root: $path" ;; esac
+  parent=${path%/*}; [ "$parent" != "$path" ] || die "invalid managed local path: $path"
+  validate_existing_local_dir_chain "$parent"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -d "$path" ] && [ ! -L "$path" ] || die "managed local directory is unsafe: $path"
+  fi
+}
+
+ensure_local_dir() {
+  local path=$1 parent
+  validate_existing_local_dir_chain "$path"
+  [ -d "$path" ] && return 0
+  if [ "$path" = "$STATE_ANCHOR" ]; then
+    mkdir -p "$path" || die "cannot create local state root: $path"
+  else
+    parent=${path%/*}; [ "$parent" != "$path" ] || die "invalid managed local path: $path"
+    ensure_local_dir "$parent"
+    if ! mkdir "$path" 2>/dev/null; then
+      [ -d "$path" ] && [ ! -L "$path" ] || die "cannot safely create managed local directory: $path"
+    fi
+  fi
+  [ -d "$path" ] && [ ! -L "$path" ] || die "cannot safely create managed local directory: $path"
+}
+
+require_local_dir() {
+  validate_existing_local_dir_chain "$1"
+  [ -d "$1" ] && [ ! -L "$1" ] || die "managed local directory is missing or unsafe: $1"
+}
+
+write_exclusive_file() {
+  local path=$1 text=$2
+  [ ! -e "$path" ] && [ ! -L "$path" ] || die "exclusive managed file already exists: $path"
+  (umask 077; set -C; printf '%s' "$text" > "$path") ||
+    die "cannot exclusively create managed file: $path"
+  [ -f "$path" ] && [ ! -L "$path" ] || die "managed file is not a regular file: $path"
+}
+
+safe_remove_local_dir() {
+  require_local_dir "$1"
+  rm -rf -- "$1"
+}
+
 read_state() {
   STATE_PRESENT=0
   [ ! -L "$STATE_FILE" ] || die "state file must not be a symlink"
@@ -506,6 +610,7 @@ read_state() {
   validate_baseline_generation "$ST_BASELINE_EPOCH"
   STATE_PRESENT=1
 }
+validate_existing_local_dir_chain "$PROJECT_STATE"
 read_state
 
 marker_text() {
@@ -533,11 +638,12 @@ validate_marker_text() {
 }
 require_marker() {
   local text
-  text=$(ssh_read "cd \"\$HOME\"; cat $(sq "$REMOTE_CONTROL/marker") 2>/dev/null") || die "remote marker is missing; refusing destination adoption"
+  text=$(ssh_read "set -eu; cd \"\$HOME\"; $(remote_safe_dir_prelude); require_dir $(sq "$REMOTE_CONTROL"); marker=$(sq "$REMOTE_CONTROL/marker"); [ -f \"\$marker\" ] && [ ! -L \"\$marker\" ]; cat \"\$marker\"") ||
+    die "remote marker is missing or unsafe; refusing destination adoption"
   validate_marker_text "$text" || die "$MARKER_ERROR"
 }
 remote_destination_state() {
-  ssh_run "cd \"\$HOME\"; if [ -e $(sq "$REMOTE_DIR") ]; then if [ -f $(sq "$REMOTE_CONTROL/marker") ]; then echo marked; else echo unmarked; fi; else echo absent; fi"
+  ssh_run "cd \"\$HOME\"; dir=$(sq "$REMOTE_DIR"); marker=$(sq "$REMOTE_CONTROL/marker"); if [ -e \"\$dir\" ] || [ -L \"\$dir\" ]; then [ -d \"\$dir\" ] && [ ! -L \"\$dir\" ] || exit 2; if [ -f \"\$marker\" ] && [ ! -L \"\$marker\" ]; then echo marked; else echo unmarked; fi; else echo absent; fi"
 }
 
 load_frozen_filters() {
@@ -646,7 +752,9 @@ cleanup() {
   local rc=$?
   trap - EXIT HUP INT TERM
   if [ "$PUBLISHED" -eq 0 ]; then
-    [ -z "$LOCAL_STAGE" ] || rm -rf "$LOCAL_STAGE"
+    if [ -n "$LOCAL_STAGE" ] && [ -d "$LOCAL_STAGE" ] && [ ! -L "$LOCAL_STAGE" ]; then
+      safe_remove_local_dir "$LOCAL_STAGE"
+    fi
     if [ -n "$REMOTE_STAGE" ]; then ssh_run "cd \"\$HOME\"; rm -rf $(sq "$REMOTE_STAGE")" >/dev/null 2>&1 || true; fi
   fi
   if [ "$LOCKED_REMOTE" -eq 1 ]; then
@@ -671,7 +779,8 @@ release_locks() {
 trap cleanup EXIT HUP INT TERM
 
 acquire_locks() {
-  mkdir -p "${LOCAL_LOCK%/*}"
+  umask 077
+  ensure_local_dir "${LOCAL_LOCK%/*}"
   if ! mkdir "$LOCAL_LOCK" 2>/dev/null; then
     oldpid=$(cat "$LOCAL_LOCK/pid" 2>/dev/null || true)
     case "$oldpid" in
@@ -679,16 +788,23 @@ acquire_locks() {
       *) die "local mutation lock is held by PID $oldpid; stale locks require explicit inspection and removal" ;;
     esac
   fi
-  printf '%s\n' "$$" > "$LOCAL_LOCK/pid"; printf '%s\n' "$TOKEN" > "$LOCAL_LOCK/token"; LOCKED_LOCAL=1
-  script="set -eu; cd \"\$HOME\"; mkdir -p $(sq "$REMOTE_ROOT/.ompup-v2/locks"); mkdir $(sq "$REMOTE_LOCK") || { echo 'remote mutation lock is held' >&2; exit 3; }; printf '%s\\n' $(sq "$TOKEN") > $(sq "$REMOTE_LOCK/token")"
+  [ -d "$LOCAL_LOCK" ] && [ ! -L "$LOCAL_LOCK" ] || die "local mutation lock is unsafe"
+  write_exclusive_file "$LOCAL_LOCK/pid" "$$"$'\n'
+  write_exclusive_file "$LOCAL_LOCK/token" "$TOKEN"$'\n'
+  LOCKED_LOCAL=1
+  script="set -eu; cd \"\$HOME\"; umask 077; $(remote_safe_dir_prelude); safe_dir $(sq "$REMOTE_ROOT"); safe_dir $(sq "$REMOTE_ROOT/.ompup-v2"); safe_dir $(sq "$REMOTE_ROOT/.ompup-v2/locks"); lock=$(sq "$REMOTE_LOCK"); mkdir \"\$lock\" || { echo 'remote mutation lock is held' >&2; exit 3; }; [ -d \"\$lock\" ] && [ ! -L \"\$lock\" ]; set -C; printf '%s\\n' $(sq "$TOKEN") > \"\$lock/token\"; [ -f \"\$lock/token\" ] && [ ! -L \"\$lock/token\" ]"
   ssh_run "$script" || die "cannot acquire remote mutation lock"
   LOCKED_REMOTE=1
 }
 
 write_state() {
-  local owner=$1 epoch=$2 baseline_epoch=$3 ack=$4 tmp="$PROJECT_STATE/.state.$TOKEN"
-  umask 077
-  cat > "$tmp" <<EOF
+  local owner=$1 epoch=$2 baseline_epoch=$3 ack=$4
+  local tmp_dir="$PROJECT_STATE/.state-tmp-$TOKEN" tmp="$PROJECT_STATE/.state-tmp-$TOKEN/state" text
+  ensure_local_dir "$PROJECT_STATE"
+  [ ! -e "$tmp_dir" ] && [ ! -L "$tmp_dir" ] || die "local state temp directory already exists"
+  mkdir "$tmp_dir" || die "cannot exclusively create local state temp directory"
+  [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ] || die "local state temp directory is unsafe"
+  text=$(cat <<EOF
 schema	2
 identity_kind	$IDENTITY_KIND
 identity_hash	$IDENTITY_HASH
@@ -707,8 +823,24 @@ git_mode	$GIT_MODE
 git_branch	$GIT_BRANCH
 git_oid	$GIT_OID
 EOF
-  chmod 600 "$tmp"
+)
+  write_exclusive_file "$tmp" "$text"$'\n'
+  [ ! -L "$STATE_FILE" ] || die "state file became a symlink"
+  [ ! -e "$STATE_FILE" ] || [ -f "$STATE_FILE" ] || die "state path is not a regular file"
   mv "$tmp" "$STATE_FILE"
+  rmdir "$tmp_dir"
+}
+
+remote_remove_transaction_artifacts() {
+  local txn_token=$1 script removals artifact
+  shift
+  script="set -eu; cd \"\$HOME\"; $(remote_control_dirs_script); safe_dir $(sq "$REMOTE_CONTROL/txn"); txn=$(sq "$REMOTE_CONTROL/txn/$txn_token"); if [ -e \"\$txn\" ] || [ -L \"\$txn\" ]; then [ -d \"\$txn\" ] && [ ! -L \"\$txn\" ]; fi"
+  removals=$(sq "$REMOTE_CONTROL/txn/$txn_token")
+  for artifact in "$@"; do
+    script="$script; artifact=$(sq "$artifact"); { [ ! -e \"\$artifact\" ] && [ ! -L \"\$artifact\" ]; } || { [ -d \"\$artifact\" ] && [ ! -L \"\$artifact\" ]; }"
+    removals="$removals $(sq "$artifact")"
+  done
+  ssh_run "$script; rm -rf $removals"
 }
 
 # Recover the one durable local journal before starting another mutation.
@@ -792,7 +924,7 @@ recover_transaction() {
     else
       [ -z "$(compare_remote "$BASELINES/$target/tree" "$REMOTE_DIR")" ] ||
         die "committed remote target changed; preserving recovery artifacts"
-      ssh_run "cd \"\$HOME\"; rm -rf $(sq "$remote_backup") $(sq "$candidate") $(sq "$REMOTE_CONTROL/txn/$txn_token")" ||
+      remote_remove_transaction_artifacts "$txn_token" "$remote_backup" "$candidate" ||
         die "cannot finalize committed transaction cleanup"
     fi
     [ ! -e "$local_backup" ] || { [ -d "$local_backup" ] && [ ! -L "$local_backup" ]; } ||
@@ -801,7 +933,7 @@ recover_transaction() {
       die "local transaction candidate is unsafe"
     rm -rf -- "$local_backup" "$local_candidate"
     [ "$pre" = none ] || remove_baseline_generation "$pre"
-    rm -rf -- "$txn_dir"
+    safe_remove_local_dir "$txn_dir"
     LOCAL_INSPECT_ROOT=$ROOT
     say "ompup: finalized committed transaction $txn_token"
     return 0
@@ -838,18 +970,30 @@ recover_transaction() {
       rm -rf -- "$local_candidate"
     fi
     remove_baseline_generation "$target"
-    rm -rf -- "$txn_dir"
+    safe_remove_local_dir "$txn_dir"
   else
     if [ "$pre" = none ]; then
+      local marker_state live_diff git_changed=0
       state=$(remote_destination_state) || die "cannot inspect initial-sync recovery"
-      if ssh_run "cd \"\$HOME\"; [ -f $(sq "$REMOTE_CONTROL/marker") ]"; then
-        require_marker
-        [ "$state" = absent ] || [ "$state" = marked ] || die "initial-sync recovery found an unmarked destination"
-        ssh_run "cd \"\$HOME\"; rm -rf $(sq "$REMOTE_DIR") $(sq "$REMOTE_CONTROL/marker")"
-      elif [ "$state" != absent ]; then
-        die "initial-sync recovery found a destination without its transaction marker"
+      marker_state=$(ssh_read "cd \"\$HOME\"; marker=$(sq "$REMOTE_CONTROL/marker"); if [ -L \"\$marker\" ] || { [ -e \"\$marker\" ] && [ ! -f \"\$marker\" ]; }; then echo unsafe; elif [ -f \"\$marker\" ]; then echo regular; else echo absent; fi") ||
+        die "cannot inspect initial-sync marker"
+      [ "$marker_state" != unsafe ] || die "initial-sync recovery marker is unsafe"
+      [ "$marker_state" != regular ] || require_marker
+      if [ "$state" = absent ]; then
+        [ "$marker_state" != regular ] ||
+          ssh_run "set -eu; cd \"\$HOME\"; marker=$(sq "$REMOTE_CONTROL/marker"); [ -f \"\$marker\" ] && [ ! -L \"\$marker\" ]; rm \"\$marker\""
+      else
+        live_diff=$(compare_remote "$txn_dir/after" "$REMOTE_DIR") ||
+          die "cannot validate initial-sync recovery live tree"
+        (require_remote_path_git_match "$REMOTE_DIR") || git_changed=1
+        if [ -n "$live_diff" ] || [ "$git_changed" -eq 1 ]; then
+          die "initial-sync recovery found a third remote version; preserving live tree and transaction artifacts"
+        fi
+        [ "$state" != marked ] || [ "$marker_state" = regular ] ||
+          die "initial-sync recovery marker classification changed"
+        ssh_run "set -eu; cd \"\$HOME\"; dir=$(sq "$REMOTE_DIR"); [ -d \"\$dir\" ] && [ ! -L \"\$dir\" ]; rm -rf \"\$dir\"; marker=$(sq "$REMOTE_CONTROL/marker"); if [ -e \"\$marker\" ] || [ -L \"\$marker\" ]; then [ -f \"\$marker\" ] && [ ! -L \"\$marker\" ]; rm \"\$marker\"; fi"
       fi
-      ssh_run "cd \"\$HOME\"; rm -rf $(sq "$candidate") $(sq "$remote_backup") $(sq "$REMOTE_CONTROL/txn/$txn_token")"
+      remote_remove_transaction_artifacts "$txn_token" "$candidate" "$remote_backup"
     elif ssh_run "cd \"\$HOME\"; [ -d $(sq "$remote_backup") ] && [ ! -L $(sq "$remote_backup") ]"; then
       backup_diff=$(compare_remote "$txn_dir/before" "$remote_backup") || die "cannot validate sync recovery backup"
       live=$(ssh_read "cd \"\$HOME\"; if [ -e $(sq "$REMOTE_DIR") ] || [ -L $(sq "$REMOTE_DIR") ]; then echo present; else echo absent; fi") ||
@@ -867,14 +1011,14 @@ recover_transaction() {
       if [ -n "$backup_diff" ] || [ -n "$live_diff" ]; then
         die "sync recovery found a third remote version; restored it and preserved transaction artifacts"
       fi
-      ssh_run "cd \"\$HOME\"; rm -rf $(sq "$failed") $(sq "$candidate") $(sq "$REMOTE_CONTROL/txn/$txn_token")"
+      remote_remove_transaction_artifacts "$txn_token" "$failed" "$candidate"
     else
       [ -z "$(compare_remote "$txn_dir/before" "$REMOTE_DIR")" ] ||
         die "unpublished sync destination changed; preserving transaction artifacts"
-      ssh_run "cd \"\$HOME\"; rm -rf $(sq "$candidate") $(sq "$REMOTE_CONTROL/txn/$txn_token")"
+      remote_remove_transaction_artifacts "$txn_token" "$candidate"
     fi
     remove_baseline_generation "$target"
-    rm -rf -- "$txn_dir"
+    safe_remove_local_dir "$txn_dir"
   fi
   PUBLISHED=0
   LOCAL_STAGE=
@@ -883,28 +1027,48 @@ recover_transaction() {
   say "ompup: recovered uncommitted transaction $txn_token to its pre-tree"
 }
 
+create_local_txn_dirs() {
+  ensure_local_dir "$TRANSACTIONS"
+  LOCAL_STAGE="$TRANSACTIONS/$TOKEN"
+  [ ! -e "$LOCAL_STAGE" ] && [ ! -L "$LOCAL_STAGE" ] || die "local transaction token directory already exists"
+  mkdir "$LOCAL_STAGE" || die "cannot exclusively create local transaction directory"
+  [ -d "$LOCAL_STAGE" ] && [ ! -L "$LOCAL_STAGE" ] || die "local transaction directory is unsafe"
+  mkdir "$LOCAL_STAGE/after" "$LOCAL_STAGE/before"
+}
+
+write_local_journal_temp() {
+  local operation=$1 epoch=$2 text
+  text=$(journal_text "$TOKEN" "$operation" "${ST_EPOCH:-none}" "$epoch" "${ST_OWNER:-none}" \
+    "$([ "$operation" = pull ] && printf local || printf remote)")
+  write_exclusive_file "$LOCAL_STAGE/journal.tmp" "$text"$'\n'
+}
+
 prepare_local_txn() {
   local epoch=$1
-  LOCAL_STAGE="$TRANSACTIONS/$TOKEN"
-  mkdir -p "$LOCAL_STAGE/after" "$LOCAL_STAGE/before"
+  create_local_txn_dirs
   write_rules "$LOCAL_STAGE/rules"
   rsync_copy_local "$ROOT" "$LOCAL_STAGE/after"
   [ -z "$(compare_local "$LOCAL_STAGE/after" "$ROOT")" ] || die "local source changed while staging"
   if [ "$STATE_PRESENT" -eq 1 ]; then rsync_copy_local "$BASELINES/$ST_BASELINE_EPOCH/tree" "$LOCAL_STAGE/before"; fi
-  cat > "$LOCAL_STAGE/journal.tmp" <<EOF
-schema	2
-token	$TOKEN
-operation	$CMD
-pre_epoch	${ST_EPOCH:-none}
-target_epoch	$epoch
-pre_owner	${ST_OWNER:-none}
-target_owner	$([ "$CMD" = pull ] && printf local || printf remote)
-EOF
+  write_local_journal_temp "$CMD" "$epoch"
 }
-publish_local_journal() { mv "$LOCAL_STAGE/journal.tmp" "$LOCAL_STAGE/journal"; PUBLISHED=1; }
+publish_local_journal() {
+  [ -f "$LOCAL_STAGE/journal.tmp" ] && [ ! -L "$LOCAL_STAGE/journal.tmp" ] ||
+    die "local transaction journal temp is unsafe"
+  [ ! -e "$LOCAL_STAGE/journal" ] && [ ! -L "$LOCAL_STAGE/journal" ] ||
+    die "local transaction journal already exists"
+  mv "$LOCAL_STAGE/journal.tmp" "$LOCAL_STAGE/journal"
+  [ -f "$LOCAL_STAGE/journal" ] && [ ! -L "$LOCAL_STAGE/journal" ] ||
+    die "published local transaction journal is unsafe"
+  PUBLISHED=1
+}
 materialize_baseline() {
   local epoch=$1 source=$2
-  mkdir -p "$BASELINES/$epoch/tree"
+  ensure_local_dir "$BASELINES"
+  [ ! -e "$BASELINES/$epoch" ] && [ ! -L "$BASELINES/$epoch" ] ||
+    die "baseline generation already exists"
+  mkdir "$BASELINES/$epoch"
+  mkdir "$BASELINES/$epoch/tree"
   rsync_copy_local "$source" "$BASELINES/$epoch/tree"
   cp "$LOCAL_STAGE/rules" "$BASELINES/$epoch/rules"
   [ -z "$(compare_local "$source" "$BASELINES/$epoch/tree")" ] || die "baseline materialization validation failed"
@@ -916,23 +1080,24 @@ remote_make_candidate() {
   local initialized=$1 candidate=$2 script
   if [ "$initialized" -eq 0 ]; then
     if [ "$IDENTITY_KIND" = git ]; then
-      script="set -eu; cd \"\$HOME\"; mkdir -p $(sq "$REMOTE_ROOT"); git clone --no-checkout --origin origin -- $(sq "$ORIGIN") $(sq "$candidate")"
+      script="set -eu; cd \"\$HOME\"; $(remote_safe_dir_prelude); safe_dir $(sq "$REMOTE_ROOT"); git clone --no-checkout --origin origin -- $(sq "$ORIGIN") $(sq "$candidate")"
       if [ "$GIT_MODE" = branch ]; then script="$script; git -C $(sq "$candidate") cat-file -e $(sq "$GIT_OID^{commit}"); git -C $(sq "$candidate") checkout -B $(sq "$GIT_BRANCH") $(sq "$GIT_OID")"
       elif [ "$GIT_MODE" = detached ]; then script="$script; git -C $(sq "$candidate") cat-file -e $(sq "$GIT_OID^{commit}"); git -C $(sq "$candidate") checkout --detach $(sq "$GIT_OID")"
       else script="$script; git -C $(sq "$candidate") checkout --orphan $(sq "$GIT_BRANCH"); git -C $(sq "$candidate") rm -rf --ignore-unmatch . >/dev/null 2>&1 || true"; fi
       script="$script; candidate=$(sq "$candidate"); for entry in \"\$candidate\"/* \"\$candidate\"/.[!.]* \"\$candidate\"/..?*; do [ -e \"\$entry\" ] || [ -L \"\$entry\" ] || continue; [ \"\${entry##*/}\" = .git ] || rm -rf -- \"\$entry\"; done"
     else
-      script="set -eu; cd \"\$HOME\"; mkdir -p $(sq "$REMOTE_ROOT"); mkdir $(sq "$candidate")"
+      script="set -eu; cd \"\$HOME\"; $(remote_safe_dir_prelude); safe_dir $(sq "$REMOTE_ROOT"); mkdir $(sq "$candidate")"
     fi
   else
-    script="set -eu; cd \"\$HOME\"; [ ! -e $(sq "$candidate") ]; cp -Rp $(sq "$REMOTE_DIR") $(sq "$candidate")"
+    script="set -eu; cd \"\$HOME\"; $(remote_safe_dir_prelude); require_dir $(sq "$REMOTE_ROOT"); dir=$(sq "$REMOTE_DIR"); [ -d \"\$dir\" ] && [ ! -L \"\$dir\" ]; [ ! -e $(sq "$candidate") ] && [ ! -L $(sq "$candidate") ]; cp -Rp \"\$dir\" $(sq "$candidate")"
   fi
   ssh_run "$script" || die "failed to build remote whole-tree candidate"
   REMOTE_STAGE=$candidate
 }
 remote_publish_marker() {
-  ssh_run "set -eu; cd \"\$HOME\"; mkdir -p $(sq "$REMOTE_CONTROL"); umask 077; cat > $(sq "$REMOTE_CONTROL/marker.tmp.$TOKEN")" < /dev/null
-  ssh_write "set -eu; cd \"\$HOME\"; umask 077; cat > $(sq "$REMOTE_CONTROL/marker.tmp.$TOKEN"); mv $(sq "$REMOTE_CONTROL/marker.tmp.$TOKEN") $(sq "$REMOTE_CONTROL/marker")" "$(marker_text)"
+  local text tmp_dir="$REMOTE_CONTROL/.marker-tmp-$TOKEN"
+  text=$(marker_text)
+  ssh_write "set -eu; cd \"\$HOME\"; umask 077; $(remote_control_dirs_script); marker=$(sq "$REMOTE_CONTROL/marker"); tmp_dir=$(sq "$tmp_dir"); [ ! -e \"\$marker\" ] && [ ! -L \"\$marker\" ]; [ ! -e \"\$tmp_dir\" ] && [ ! -L \"\$tmp_dir\" ]; mkdir \"\$tmp_dir\"; [ -d \"\$tmp_dir\" ] && [ ! -L \"\$tmp_dir\" ]; set -C; cat > \"\$tmp_dir/marker\"; [ -f \"\$tmp_dir/marker\" ] && [ ! -L \"\$tmp_dir/marker\" ]; mv \"\$tmp_dir/marker\" \"\$marker\"; rmdir \"\$tmp_dir\"" "$text"$'\n'
 }
 journal_text() {
   printf 'schema\t2\ntoken\t%s\noperation\t%s\npre_epoch\t%s\ntarget_epoch\t%s\npre_owner\t%s\ntarget_owner\t%s\n' \
@@ -941,7 +1106,7 @@ journal_text() {
 validate_remote_journal_if_present() {
   local token=$1 operation=$2 pre=$3 target=$4 pre_owner=$5 target_owner=$6 actual expected path
   path="$REMOTE_CONTROL/txn/$token/journal"
-  actual=$(ssh_read "set -eu; cd \"\$HOME\"; if [ -e $(sq "$path") ] || [ -L $(sq "$path") ]; then [ -f $(sq "$path") ] && [ ! -L $(sq "$path") ]; printf 'present\\n'; cat $(sq "$path"); else printf absent; fi") ||
+  actual=$(ssh_read "set -eu; cd \"\$HOME\"; path=$(sq "$path"); if [ -e \"\$path\" ] || [ -L \"\$path\" ]; then $(remote_safe_dir_prelude); require_dir $(sq "$REMOTE_CONTROL/txn/$token"); [ -f \"\$path\" ] && [ ! -L \"\$path\" ]; printf 'present\\n'; cat \"\$path\"; else printf absent; fi") ||
     die "remote transaction journal is unsafe or unreadable"
   [ "$actual" != absent ] || return 0
   expected="present"$'\n'"$(journal_text "$token" "$operation" "$pre" "$target" "$pre_owner" "$target_owner")"
@@ -952,7 +1117,7 @@ remote_publish_journal() {
   local operation=$1 epoch=$2 text pre=${ST_EPOCH:-none} pre_owner=${ST_OWNER:-none} target_owner
   target_owner=$([ "$operation" = pull ] && printf local || printf remote)
   text=$(journal_text "$TOKEN" "$operation" "$pre" "$epoch" "$pre_owner" "$target_owner")
-  ssh_write "set -eu; cd \"\$HOME\"; mkdir -p $(sq "$REMOTE_CONTROL/txn/$TOKEN"); umask 077; cat > $(sq "$REMOTE_CONTROL/txn/$TOKEN/journal")" "$text"
+  ssh_write "set -eu; cd \"\$HOME\"; umask 077; $(remote_control_dirs_script); safe_dir $(sq "$REMOTE_CONTROL/txn"); txn=$(sq "$REMOTE_CONTROL/txn/$TOKEN"); [ ! -e \"\$txn\" ] && [ ! -L \"\$txn\" ]; mkdir \"\$txn\"; [ -d \"\$txn\" ] && [ ! -L \"\$txn\" ]; set -C; cat > \"\$txn/journal\"; [ -f \"\$txn/journal\" ] && [ ! -L \"\$txn/journal\" ]" "$text"$'\n'
 }
 remote_swap_candidate() {
   local initialized=$1 candidate=$2 backup="$REMOTE_ROOT/.ompup-backup-$ADDRESS-$TOKEN"
@@ -971,7 +1136,7 @@ remote_swap_candidate() {
 }
 remote_cleanup_commit() {
   local backup=$1
-  ssh_run "cd \"\$HOME\"; rm -rf $(sq "$backup") $(sq "$REMOTE_CONTROL/txn/$TOKEN")"
+  remote_remove_transaction_artifacts "$TOKEN" "$backup"
 }
 sync_real() {
   check_ack
@@ -998,11 +1163,12 @@ sync_real() {
   require_remote_path_git_match "$candidate"
   [ -z "$(compare_local "$LOCAL_STAGE/after" "$ROOT")" ] || die "local source changed before publication"
   if [ "$initialized" -eq 1 ]; then require_marker; require_git_match; fi
+  require_live_local_git_tuple
   publish_local_journal
   remote_publish_journal sync "$epoch"
   validate_remote_journal_if_present "$TOKEN" sync "${ST_EPOCH:-none}" "$epoch" "${ST_OWNER:-none}" remote
-  if [ "$initialized" -eq 0 ]; then remote_publish_marker; fi
   backup=$(remote_swap_candidate "$initialized" "$candidate")
+  if [ "$initialized" -eq 0 ]; then remote_publish_marker; fi
   remote_destination_changed=0
   if [ "$initialized" -eq 1 ]; then
     (require_remote_path_git_match "$backup") || remote_destination_changed=1
@@ -1020,11 +1186,12 @@ sync_real() {
   materialize_baseline "$epoch" "$LOCAL_STAGE/after"
   ack=${ST_ACK_DIGEST:--}; [ -n "$TRACKED_EXCLUDED" ] && ack=$ACK_DIGEST
   old_baseline=${ST_BASELINE_EPOCH:-none}
+  require_live_local_git_tuple
   write_state remote "$epoch" "$epoch" "$ack"
   if remote_cleanup_commit "$backup"; then
     cleanup_ok=1
     [ "$old_baseline" = none ] || remove_baseline_generation "$old_baseline"
-    rm -rf -- "$LOCAL_STAGE"
+    safe_remove_local_dir "$LOCAL_STAGE"
     PUBLISHED=0; LOCAL_STAGE=
   else
     warn "handoff committed; remote transaction cleanup remains recoverable"
@@ -1050,19 +1217,12 @@ pull_real() {
   add_extra_filters
   make_filter_args; FILTER_DIGEST=$(filter_digest); compute_tracked_excluded; check_ack
   epoch=$(next_epoch "$ST_EPOCH")
-  LOCAL_STAGE="$TRANSACTIONS/$TOKEN"; mkdir -p "$LOCAL_STAGE/after" "$LOCAL_STAGE/before"; write_rules "$LOCAL_STAGE/rules"
+  create_local_txn_dirs
+  write_rules "$LOCAL_STAGE/rules"
   rsync_copy_local "$ROOT" "$LOCAL_STAGE/before"
   rsync_remote_to_local "$REMOTE_DIR" "$LOCAL_STAGE/after"
   [ -z "$(compare_remote "$LOCAL_STAGE/after" "$REMOTE_DIR")" ] || die "remote source changed while staging pull"
-  cat > "$LOCAL_STAGE/journal.tmp" <<EOF
-schema	2
-token	$TOKEN
-operation	pull
-pre_epoch	$ST_EPOCH
-target_epoch	$epoch
-pre_owner	$ST_OWNER
-target_owner	local
-EOF
+  write_local_journal_temp pull "$epoch"
   # Whole local candidate includes .git copied internally, then managed data
   # is promoted into it. The live root is never an in-place rsync target.
   parent=${ROOT%/*}; [ -n "$parent" ] || parent=/
@@ -1074,6 +1234,7 @@ EOF
   [ -z "$(compare_local "$LOCAL_STAGE/after" "$candidate")" ] || die "local candidate validation failed"
   require_local_path_git_match "$candidate"
   [ -z "$(compare_local "$LOCAL_STAGE/before" "$ROOT")" ] || die "local destination changed before publication"
+  require_live_local_git_tuple
   publish_local_journal
   mv "$ROOT" "$backup"
   if ! mv "$candidate" "$ROOT"; then
@@ -1101,9 +1262,13 @@ EOF
   materialize_baseline "$epoch" "$LOCAL_STAGE/after"
   ack=$ST_ACK_DIGEST; [ -n "$TRACKED_EXCLUDED" ] && ack=$ACK_DIGEST
   old_baseline=$ST_BASELINE_EPOCH
+  require_live_local_git_tuple
   write_state local "$epoch" "$epoch" "$ack"
   remove_baseline_generation "$old_baseline"
-  rm -rf -- "$backup" "$LOCAL_STAGE"
+  [ ! -e "$backup" ] || { [ -d "$backup" ] && [ ! -L "$backup" ]; } ||
+    die "local backup became unsafe before cleanup"
+  rm -rf -- "$backup"
+  safe_remove_local_dir "$LOCAL_STAGE"
   PUBLISHED=0; LOCAL_STAGE=
   ST_OWNER=local; ST_EPOCH=$epoch; ST_BASELINE_EPOCH=$epoch
   release_locks

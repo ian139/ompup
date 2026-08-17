@@ -21,6 +21,51 @@ after_fail=0
 if [ -n "${OMPUP_FAKE_SSH_FAIL_AFTER_MATCH:-}" ]; then
   case "$cmd" in *"$OMPUP_FAKE_SSH_FAIL_AFTER_MATCH"*) after_fail=1 ;; esac
 fi
+if [ -n "${OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH:-}" ]; then
+  case "$cmd" in
+    *"$OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH"*)
+      for candidate in "$OMPUP_FAKE_REMOTE_HOME"/Projects/.ompup-candidate-*; do
+        [ -d "$candidate" ] || continue
+        rest=${candidate##*/}; rest=${rest#.ompup-candidate-}; address=${rest%-*-*}
+        mkdir "$OMPUP_FAKE_REMOTE_HOME/Projects/$address"
+        printf 'concurrent\n' > "$OMPUP_FAKE_REMOTE_HOME/Projects/$address/concurrent.txt"
+      done ;;
+  esac
+fi
+if [ -n "${OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH:-}" ]; then
+  case "$cmd" in
+    *"$OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH"*)
+      if [ ! -e "$OMPUP_FAKE_SSH_GIT_COMMIT_STAMP" ]; then
+        : > "$OMPUP_FAKE_SSH_GIT_COMMIT_STAMP"
+        git -C "$OMPUP_FAKE_SSH_GIT_PROJECT" commit --allow-empty -m concurrent-metadata >/dev/null
+      fi ;;
+  esac
+fi
+if [ -n "${OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH:-}" ]; then
+  case "$cmd" in
+    *"$OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH"*)
+      target=$OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET
+      journal=$(find "$XDG_STATE_HOME/ompup/targets" -type f -path '*/transactions/*/journal' -print -quit)
+      [ -n "$journal" ] || { echo 'fixture could not locate local journal' >&2; exit 97; }
+      txn=${journal%/journal}; token=${txn##*/}; project_state=${txn%/transactions/*}
+      lock=$(find "$OMPUP_FAKE_REMOTE_HOME/Projects/.ompup-v2/locks" -type d -name '*.lock' -print -quit)
+      address=${lock##*/}; address=${address%.lock}
+      control="$OMPUP_FAKE_REMOTE_HOME/Projects/.ompup-v2/$address"
+      case "$OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND" in
+        journal)
+          mkdir -p "$control/txn"
+          ln -s "$target" "$control/txn/$token" ;;
+        marker)
+          mkdir -p "$control"
+          ln -s "$target/value" "$control/marker.tmp.$token"
+          ln -s "$target" "$control/.marker-tmp-$token" ;;
+        state)
+          ln -s "$target/value" "$project_state/.state.$token"
+          ln -s "$target" "$project_state/.state-tmp-$token" ;;
+        *) echo 'unknown fixture symlink attack' >&2; exit 98 ;;
+      esac ;;
+  esac
+fi
 if [ -n "${OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH:-}" ] && [ -n "${OMPUP_FAKE_SSH_MUTATE_PATH:-}" ]; then
   case "$cmd" in
     *"$OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH"*)
@@ -35,6 +80,10 @@ fi
 cd "$OMPUP_FAKE_REMOTE_HOME"
 HOME=$OMPUP_FAKE_REMOTE_HOME export HOME
 unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP
+unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
+unset OMPUP_FAKE_SSH_GIT_COMMIT_STAMP OMPUP_FAKE_SSH_GIT_PROJECT
+unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND
+unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET
 /bin/bash -c "$cmd"
 rc=$?
 [ "$after_fail" -eq 0 ] || { echo "fixture failed after matched command" >&2; exit 255; }

@@ -37,6 +37,10 @@ new_fixture() {
   unset OMPUP_EXCLUDES OMPUP_CMD OMPUP_FAKE_SSH_FAIL OMPUP_FAKE_SSH_FAIL_MATCH
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH OMPUP_FAKE_SSH_MUTATE_PATH
   unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP
+  unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
+  unset OMPUP_FAKE_SSH_GIT_COMMIT_STAMP OMPUP_FAKE_SSH_GIT_PROJECT
+  unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND
+  unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET
 }
 run_ompup() {
   set +e
@@ -230,7 +234,8 @@ case_recovery_and_rollback() {
   new_fixture; printf one > "$PROJECT/file.txt"
   export OMPUP_FAKE_SSH_FAIL_MATCH="mv '\\''Projects/.ompup-candidate"
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'post-journal initial swap failure should fail'
-  assert_file "$(marker_file)"; [ -n "$(find "$STATE" -type f -name journal -print -quit)" ] || fail 'durable initial journal missing'
+  [ -z "$(marker_file 2>/dev/null || true)" ] || fail 'failed initial rename published marker'
+  [ -n "$(find "$STATE" -type f -name journal -print -quit)" ] || fail 'durable initial journal missing'
   unset OMPUP_FAKE_SSH_FAIL_MATCH
   run_ompup sync; assert_eq "$RC" 0; assert_contains "$OUT" 'recovered uncommitted transaction'
 
@@ -494,6 +499,118 @@ case_cleanup_recovery_and_status_blockers() {
   assert_contains "$OUT" 'remote-changed: (not compared)'
 }
 
+case_initial_sync_third_versions() {
+  new_fixture
+  printf 'source\n' > "$PROJECT/file.txt"
+  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH="mv '\\''Projects/.ompup-candidate"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'post-rename crash injection should fail'
+  local rd journal
+  rd=$(remote_project); journal=$(transaction_journal)
+  assert_file "$rd/file.txt"; assert_file "$journal"
+  printf 'remote edit\n' > "$rd/post-crash.txt"
+  unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'post-crash third version must block recovery'
+  assert_contains "$OUT" 'third remote version'
+  assert_eq "$(cat "$rd/post-crash.txt")" 'remote edit'
+  assert_file "$journal"
+
+  new_fixture
+  printf 'source\n' > "$PROJECT/file.txt"
+  export OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH="mv '\\''Projects/.ompup-candidate"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'concurrent initial destination must block promotion'
+  rd=$(remote_project); assert_eq "$(cat "$rd/concurrent.txt")" concurrent
+  unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'never-adopted concurrent destination must block recovery'
+  assert_contains "$OUT" 'third remote version'
+  assert_eq "$(cat "$rd/concurrent.txt")" concurrent
+}
+
+case_git_metadata_race() {
+  new_fixture
+  init_git
+  local rd state before_epoch before_remote
+  rd=$(remote_project)
+  run_ompup pull; assert_eq "$RC" 0
+  state=$(state_file); before_epoch=$(sed -n 's/^epoch	//p' "$state"); before_remote=$(snapshot "$rd")
+  export OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH='/txn/'
+  export OMPUP_FAKE_SSH_GIT_COMMIT_STAMP="$TMP/git-race-fired"
+  export OMPUP_FAKE_SSH_GIT_PROJECT="$PROJECT"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'metadata-only local HEAD race must block ownership commit'
+  assert_contains "$OUT" 'local candidate Git tuple changed'
+  assert_eq "$(sed -n 's/^epoch	//p' "$state")" "$before_epoch"
+  unset OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'Git divergence after rollback must remain blocked'
+  assert_contains "$OUT" 'remote Git tuple diverged'
+  assert_eq "$(snapshot "$rd")" "$before_remote"
+}
+
+case_exclusive_control_creation() {
+  local sentinel before state transactions
+
+  new_fixture
+  sentinel="$TMP/local-component-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"
+  mkdir -p "$STATE"; ln -s "$sentinel" "$STATE/ompup"; before=$(snapshot "$sentinel")
+  printf source > "$PROJECT/file"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'symlinked local state component must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture
+  init_non_git
+  run_ompup pull; assert_eq "$RC" 0
+  state=$(state_file); transactions="${state%/state}/transactions"
+  sentinel="$TMP/local-journal-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  rmdir "$transactions"; ln -s "$sentinel" "$transactions"
+  printf local > "$PROJECT/file"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'symlinked local transaction directory must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture
+  sentinel="$TMP/remote-component-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"
+  mkdir -p "$REMOTE/Projects"; ln -s "$sentinel" "$REMOTE/Projects/.ompup-v2"; before=$(snapshot "$sentinel")
+  printf source > "$PROJECT/file"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'symlinked remote control component must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture
+  sentinel="$TMP/journal-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  printf source > "$PROJECT/file"
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH='/txn/'
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND=journal
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET="$sentinel"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'precreated remote journal symlink must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture
+  sentinel="$TMP/marker-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  printf source > "$PROJECT/file"
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH='.marker'
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND=marker
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET="$sentinel"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'precreated remote marker temp symlink must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture
+  sentinel="$TMP/state-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  printf source > "$PROJECT/file"
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH='/marker'
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND=state
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET="$sentinel"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'precreated local state temp symlink must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+}
+
 all_cases=(
   help_version initial_non_git initial_git_and_git_boundary round_trip_and_status
   divergent_git dirty_git_boundaries both_side_conflict identity_isolation
@@ -502,6 +619,7 @@ all_cases=(
   quoted_paths_and_command attach_and_default_safety explicit_ownership_boundaries
   rename_gap_recovery promotion_window_conflicts remote_policy_and_secret_defaults
   malicious_state_and_journals cleanup_recovery_and_status_blockers
+  initial_sync_third_versions git_metadata_race exclusive_control_creation
 )
 
 requested=${1:-all}
