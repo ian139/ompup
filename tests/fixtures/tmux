@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+state=${OMPUP_FAKE_REMOTE_HOME:?}/.tmux-sessions
+cmd=${1:-}; shift || true
+case "$cmd" in
+  has-session)
+    target=
+    while [ "$#" -gt 0 ]; do case "$1" in -t) shift; target=${1#=};; esac; shift || true; done
+    [ -f "$state" ] && while IFS= read -r line; do [ "$line" = "$target" ] && exit 0; done < "$state"
+    exit 1 ;;
+  new-session)
+    session=
+    while [ "$#" -gt 0 ]; do case "$1" in -s) shift; session=$1;; esac; shift || true; done
+    [ -n "$session" ] || exit 2
+    touch "$state"
+    if ! while IFS= read -r line; do [ "$line" = "$session" ] && exit 0; done < "$state"; then printf '%s\n' "$session" >> "$state"; fi
+    exit 0 ;;
+  list-sessions)
+    [ -f "$state" ] || exit 1
+    while IFS= read -r line; do printf '%s: 1 windows\n' "$line"; done < "$state" ;;
+  *) echo "fixture tmux: unsupported $cmd" >&2; exit 2 ;;
+esac
