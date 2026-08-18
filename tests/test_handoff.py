@@ -178,6 +178,25 @@ class HandoffContractTests(unittest.TestCase):
             _identity, remote_origin = CLI.project_identity(root)
         self.assertEqual(remote_origin, "")
 
+    def test_project_sync_does_not_require_local_rsync(self) -> None:
+        args = SimpleNamespace(command="sync")
+        with patch.object(
+            CLI.shutil,
+            "which",
+            side_effect=lambda command: None if command == "rsync" else f"/usr/bin/{command}",
+        ):
+            CLI.validate_local_requirements(args)
+
+    def test_handoff_requires_remote_rsync(self) -> None:
+        CLI.REMOTE = "compute-box"
+        missing = SimpleNamespace(returncode=1)
+        with (
+            patch.object(CLI, "ssh_script", return_value=missing),
+            self.assertRaisesRegex(SystemExit, "1"),
+        ):
+            CLI.require_remote_command("rsync")
+
+
 
 
 

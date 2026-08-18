@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Safely enter a project-specific OMP session on a remote development box.
 
-Git history is bundled only when a remote checkout is first created; later
-committed-history changes travel through Git. Uncommitted working state is
-synchronized as a Git tree snapshot, guarded by the exact HEAD and tree
-recorded after the last successful transfer.
+Committed history and uncommitted working snapshots travel through negotiated
+Git object transport. Every transfer is guarded by the exact HEAD and tree
+recorded after the last successful synchronization.
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 from urllib.parse import parse_qsl, urlsplit
 
@@ -55,12 +53,13 @@ from ompup.hosts import (  # noqa: E402
     unpin_host,
 )
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 LEGACY_HOST = os.environ.get("OMPUP_HOST", "")
 REMOTE_ROOT = os.environ.get("OMPUP_REMOTE_ROOT", "Projects").strip("/")
 LAUNCH_OVERRIDE = os.environ.get("OMPUP_CMD", "")
 LAUNCH = ""
 REMOTE = ""
+SSH_CONTROL_PATH = ""
 PRESERVED_DIRS = {
     "node_modules",
     ".venv",
@@ -113,57 +112,102 @@ trap - EXIT
 BOOTSTRAP_SCRIPT = r"""
 set -euo pipefail
 target="$HOME/$1"
-bundle="$2"
-branch="$3"
-origin="$4"
+branch="$2"
+origin="$3"
 [ ! -e "$target" ] || { echo 'remote project path already exists' >&2; exit 4; }
 mkdir -p "$(dirname "$target")"
-cleanup() { rm -rf "$target"; [ -z "$bundle" ] || rm -f "$HOME/$bundle"; }
+cleanup() { rm -rf "$target"; }
 trap cleanup ERR INT TERM
-if [ -n "$bundle" ]; then
-  git clone -q --branch "$branch" "$HOME/$bundle" "$target"
-  git -C "$target" remote remove origin
-  rm -f "$HOME/$bundle"
-else
-  git init -q -b "$branch" "$target"
-fi
+git init -q -b "$branch" "$target"
 if [ -n "$origin" ]; then git -C "$target" remote add origin "$origin"; fi
 trap - ERR INT TERM
 """
 
-ARCHIVE_SCRIPT = r"""
+REMOVE_REMOTE_PROJECT_SCRIPT = r"""
 set -euo pipefail
-exec git -C "$HOME/$1" archive --format=tar "$2"
+target="$HOME/$1"
+[ -d "$target/.git" ] || { echo 'refusing to remove a non-repository path' >&2; exit 4; }
+rm -rf "$target"
 """
 
-FAST_FORWARD_REMOTE_SCRIPT = r"""
+APPLY_COMMIT_SCRIPT = r"""
 set -euo pipefail
 repo="$HOME/$1"
-bundle="$HOME/$2"
+incoming_ref="$2"
 branch="$3"
-cleanup() { rm -f "$bundle"; }
-trap cleanup EXIT
+expected_old="$4"
+expected_new="$5"
 current_branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD)
 if [ "$current_branch" != "$branch" ]; then
   printf 'branch mismatch: remote=%s local=%s\n' "$current_branch" "$branch" >&2
   exit 6
 fi
-git -C "$repo" fetch -q "$bundle" "refs/heads/$branch"
-incoming=$(git -C "$repo" rev-parse FETCH_HEAD)
-current=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || true)
-if [ -n "$current" ]; then
+current=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')
+if [ "$current" != "$expected_old" ]; then
+  printf 'remote HEAD changed during transfer: expected=%s actual=%s\n' "$expected_old" "$current" >&2
+  exit 7
+fi
+incoming=$(git -C "$repo" rev-parse --verify "$incoming_ref^{commit}")
+if [ "$incoming" != "$expected_new" ]; then
+  printf 'incoming commit mismatch: expected=%s actual=%s\n' "$expected_new" "$incoming" >&2
+  exit 8
+fi
+if [ "$current" != '0000000000000000000000000000000000000000' ]; then
   git -C "$repo" merge-base --is-ancestor "$current" "$incoming"
 fi
 git -C "$repo" reset --hard -q "$incoming"
+git -C "$repo" update-ref -d "$incoming_ref"
 """
 
-CREATE_REMOTE_BUNDLE_SCRIPT = r"""
+APPLY_SNAPSHOT_SCRIPT = r"""
 set -euo pipefail
 repo="$HOME/$1"
-bundle="$HOME/$2"
-branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD)
-git -C "$repo" bundle create "$bundle" "refs/heads/$branch" >/dev/null
-printf '%s\n' "$branch"
+incoming_ref="$2"
+expected_tree="$3"
+expected_head="$4"
+current=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')
+if [ "$current" != "$expected_head" ]; then
+  printf 'remote HEAD changed before snapshot apply: expected=%s actual=%s\n' "$expected_head" "$current" >&2
+  exit 7
+fi
+incoming=$(git -C "$repo" rev-parse --verify "$incoming_ref^{tree}")
+if [ "$incoming" != "$expected_tree" ]; then
+  printf 'incoming snapshot mismatch: expected=%s actual=%s\n' "$expected_tree" "$incoming" >&2
+  exit 8
+fi
+git -C "$repo" read-tree --dry-run --reset -u "$incoming_ref"
+git -C "$repo" read-tree --reset -u "$incoming_ref"
+git -C "$repo" update-ref -d "$incoming_ref"
+"""
+
+CREATE_SNAPSHOT_REF_SCRIPT = r"""
+set -euo pipefail
+repo="$HOME/$1"
+expected_head="$2"
+expected_tree="$3"
+snapshot_ref="$4"
+current=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')
+if [ "$current" != "$expected_head" ]; then
+  printf 'remote HEAD changed during export: expected=%s actual=%s\n' "$expected_head" "$current" >&2
+  exit 7
+fi
+git_dir=$(git -C "$repo" rev-parse --absolute-git-dir)
+idx=$(mktemp)
+rm -f "$idx"
+trap 'rm -f "$idx"' EXIT
+if [ -f "$git_dir/index" ]; then cp "$git_dir/index" "$idx"; fi
+GIT_INDEX_FILE="$idx" git -C "$repo" add -A -- . >/dev/null
+actual=$(GIT_INDEX_FILE="$idx" git -C "$repo" write-tree)
+if [ "$actual" != "$expected_tree" ]; then
+  printf 'remote snapshot changed during export: expected=%s actual=%s\n' "$expected_tree" "$actual" >&2
+  exit 7
+fi
+git -C "$repo" update-ref "$snapshot_ref" "$actual"
+"""
+
+DELETE_REF_SCRIPT = r"""
+set -euo pipefail
+git -C "$HOME/$1" update-ref -d "$2"
 """
 
 PREPARE_HANDOFF_SCRIPT = r"""
@@ -269,8 +313,42 @@ def run(
     )
 
 
+def configure_ssh_transport(remote: str) -> None:
+    global SSH_CONTROL_PATH
+    control_dir = Path.home() / ".cache" / "ompup" / "ssh"
+    if control_dir.is_symlink() or (control_dir.exists() and not control_dir.is_dir()):
+        raise RuntimeError(f"SSH control path is not a private directory: {control_dir}")
+    control_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    control_dir.chmod(0o700)
+    remote_key = hashlib.sha256(remote.encode()).hexdigest()[:16]
+    SSH_CONTROL_PATH = str(control_dir / f"{os.getpid()}-{remote_key}")
+
+
+def ssh_transport_args() -> list[str]:
+    if not SSH_CONTROL_PATH:
+        return []
+    return [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=60",
+        "-o",
+        f"ControlPath={SSH_CONTROL_PATH}",
+    ]
+
+
+def git_transport_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_SSH_COMMAND"] = shlex.join(["ssh", *ssh_transport_args()])
+    return env
+
+
+def rsync_args() -> list[str]:
+    return ["rsync", "-e", shlex.join(["ssh", *ssh_transport_args()])]
+
+
 def ssh_command(command: str, *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    return run(["ssh", REMOTE, command], check=check, capture=capture)
+    return run(["ssh", *ssh_transport_args(), REMOTE, command], check=check, capture=capture)
 
 
 def ssh_script(
@@ -281,7 +359,7 @@ def ssh_script(
 ) -> subprocess.CompletedProcess:
     command = "bash -s -- " + " ".join(shlex.quote(arg) for arg in args)
     return subprocess.run(
-        ["ssh", REMOTE, command],
+        ["ssh", *ssh_transport_args(), REMOTE, command],
         input=script,
         text=True,
         check=check,
@@ -374,6 +452,12 @@ def remote_state(remote_dir: str) -> str:
     return result.stdout.strip()
 
 
+def require_remote_command(command: str) -> None:
+    result = ssh_script('command -v "$1" >/dev/null 2>&1', command, check=False)
+    if result.returncode != 0:
+        die(f"required remote command not found on {REMOTE}: {command}")
+
+
 def session_exists(session: str) -> bool:
     result = ssh_script('tmux has-session -t "=$1" 2>/dev/null', session, check=False)
     return result.returncode == 0
@@ -405,9 +489,73 @@ def validate_snapshot_paths(entries: list[str]) -> None:
             die(f"sensitive path requires explicit handling and will not transfer: {entry}")
 
 
-def scan_snapshot(path: Path) -> None:
+def operation_ref(kind: str, state_key: str) -> str:
+    key = hashlib.sha256(state_key.encode()).hexdigest()[:16]
+    nonce = os.urandom(6).hex()
+    return f"refs/ompup/{kind}/{key}-{os.getpid()}-{nonce}"
+
+
+def remote_repository(remote_dir: str) -> str:
+    return f"{REMOTE}:{remote_dir}"
+
+
+def delete_local_ref(root: Path, ref: str) -> None:
+    git(root, "update-ref", "-d", ref, capture=False)
+
+
+def delete_remote_ref(remote_dir: str, ref: str) -> None:
+    ssh_script(DELETE_REF_SCRIPT, remote_dir, ref, check=False)
+
+
+def push_ref(root: Path, repository: str, source: str, destination: str) -> None:
+    git(
+        root,
+        "push",
+        "-q",
+        repository,
+        f"{source}:{destination}",
+        env=git_transport_env(),
+        capture=False,
+    )
+
+
+def fetch_ref(root: Path, repository: str, source: str, destination: str) -> None:
+    git(
+        root,
+        "fetch",
+        "-q",
+        repository,
+        f"+{source}:{destination}",
+        env=git_transport_env(),
+        capture=False,
+    )
+
+
+def scan_snapshot_tree(root: Path, tree: str) -> None:
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "ompup",
+            "GIT_AUTHOR_EMAIL": "ompup@localhost",
+            "GIT_COMMITTER_NAME": "ompup",
+            "GIT_COMMITTER_EMAIL": "ompup@localhost",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+        }
+    )
+    commit = git(root, "commit-tree", tree, "-m", "ompup snapshot", env=env)
     result = run(
-        ["gitleaks", "dir", "--no-banner", "--redact", "--log-level", "error", str(path)],
+        [
+            "gitleaks",
+            "git",
+            "--no-banner",
+            "--redact",
+            "--log-level",
+            "error",
+            f"--log-opts={commit}^!",
+            str(root),
+        ],
+        cwd=root,
         check=False,
         capture=True,
     )
@@ -415,36 +563,86 @@ def scan_snapshot(path: Path) -> None:
         die("secret scan rejected the working snapshot; review it locally with gitleaks")
 
 
-def scan_history(root: Path) -> None:
-    result = run(
-        ["gitleaks", "git", "--no-banner", "--redact", "--log-level", "error", str(root)],
-        check=False,
-        capture=True,
-    )
+def scan_history(root: Path, revision: str = "") -> None:
+    command = ["gitleaks", "git", "--no-banner", "--redact", "--log-level", "error"]
+    if revision:
+        command.append(f"--log-opts={revision}")
+    command.append(str(root))
+    result = run(command, cwd=root, check=False, capture=True)
     if result.returncode != 0:
-        die("secret scan rejected reachable Git history; review it locally with gitleaks")
+        scope = "incoming Git history" if revision else "reachable Git history"
+        die(f"secret scan rejected {scope}; review it locally with gitleaks")
 
 
-def make_local_stage(root: Path, stage: Path) -> str:
+def prepare_snapshot(root: Path) -> tuple[str, str]:
+    head = repository_head(root)
     index, tree, entries = prepare_index(root)
     try:
         validate_snapshot_paths(entries)
-        env = os.environ.copy()
-        env["GIT_INDEX_FILE"] = str(index)
-        prefix = str(stage) + os.sep
-        git(root, "checkout-index", "--all", "--force", f"--prefix={prefix}", env=env, capture=False)
     finally:
         index.unlink(missing_ok=True)
-    scan_snapshot(stage)
-    return f"{repository_head(root)}:{tree}"
+    if repository_head(root) != head:
+        die("local HEAD changed while its snapshot was being prepared; retry")
+    scan_snapshot_tree(root, tree)
+    return f"{head}:{tree}", tree
 
 
-def rsync_stage(stage: Path, destination: str) -> None:
-    args = ["rsync", "-a", "--delete", "--exclude", ".git/"]
-    for directory in sorted(PRESERVED_DIRS):
-        args.extend(["--exclude", f"{directory}/"])
-    args.extend([str(stage) + os.sep, destination])
-    run(args)
+def push_object(root: Path, remote_dir: str, object_name: str, remote_ref: str) -> None:
+    local_ref = operation_ref("outgoing", remote_ref)
+    git(root, "update-ref", local_ref, object_name, capture=False)
+    try:
+        push_ref(root, remote_repository(remote_dir), local_ref, remote_ref)
+    finally:
+        delete_local_ref(root, local_ref)
+
+
+def publish_commit(
+    root: Path,
+    state_key: str,
+    remote_dir: str,
+    branch: str,
+    expected_old: str,
+    expected_new: str,
+) -> None:
+    remote_ref = operation_ref("commits", state_key)
+    try:
+        push_object(root, remote_dir, expected_new, remote_ref)
+        result = ssh_script(
+            APPLY_COMMIT_SCRIPT,
+            remote_dir,
+            remote_ref,
+            branch,
+            expected_old,
+            expected_new,
+            check=False,
+            capture=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "remote Git rejected the update"
+            die(f"could not fast-forward remote commits: {detail}")
+    finally:
+        delete_remote_ref(remote_dir, remote_ref)
+
+
+def publish_snapshot(root: Path, state_key: str, remote_dir: str, state: str, tree: str) -> None:
+    expected_head = state.split(":", 1)[0]
+    remote_ref = operation_ref("snapshots", state_key)
+    try:
+        push_object(root, remote_dir, tree, remote_ref)
+        result = ssh_script(
+            APPLY_SNAPSHOT_SCRIPT,
+            remote_dir,
+            remote_ref,
+            tree,
+            expected_head,
+            check=False,
+            capture=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "remote Git rejected the snapshot"
+            die(f"could not apply remote working snapshot: {detail}")
+    finally:
+        delete_remote_ref(remote_dir, remote_ref)
 
 
 def bootstrap(
@@ -455,30 +653,28 @@ def bootstrap(
     identity: str,
     origin: str,
 ) -> str:
+    del project
     branch = current_branch(root)
-    with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name, tempfile.TemporaryDirectory(
-        prefix="ompup-bundle-"
-    ) as bundle_dir:
-        stage = Path(stage_name)
-        expected = make_local_stage(root, stage)
-        head = expected.split(":", 1)[0]
-        remote_bundle = ""
+    expected, tree = prepare_snapshot(root)
+    head = expected.split(":", 1)[0]
+    ssh_script(BOOTSTRAP_SCRIPT, remote_dir, branch, origin)
+    try:
         if head != "0" * 40:
             scan_history(root)
-            bundle = Path(bundle_dir) / f"{project}.bundle"
-            git(root, "bundle", "create", str(bundle), f"refs/heads/{branch}", capture=False)
-            remote_bundle = f".cache/ompup/{project}.{os.getpid()}.bundle"
-            ssh_command("mkdir -p ~/.cache/ompup")
-            run(["rsync", "-a", str(bundle), f"{REMOTE}:{remote_bundle}"])
-        ssh_script(BOOTSTRAP_SCRIPT, remote_dir, remote_bundle, branch, origin)
-        rsync_stage(stage, f"{REMOTE}:{remote_dir}/")
-
-    actual = remote_state(remote_dir)
-    if actual != expected:
-        die("remote checkout did not match the prepared snapshot; synchronization state was not recorded")
+            publish_commit(root, state_key, remote_dir, branch, "0" * 40, head)
+        if local_state(root) != expected:
+            die("local checkout changed while its snapshot was being prepared; retry")
+        publish_snapshot(root, state_key, remote_dir, expected, tree)
+        actual = remote_state(remote_dir)
+        if actual != expected:
+            die("remote checkout did not match the prepared snapshot; synchronization state was not recorded")
+    except BaseException:
+        ssh_script(REMOVE_REMOTE_PROJECT_SCRIPT, remote_dir, check=False)
+        raise
     write_baseline(state_key, identity, actual)
     print(f"ompup: bootstrapped {REMOTE}:~/{remote_dir}")
     return actual
+
 
 def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     if ancestor == "0" * 40:
@@ -490,67 +686,42 @@ def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     return result.returncode == 0
 
 
-def fast_forward_remote(root: Path, project: str, remote_dir: str, remote_head: str) -> None:
+def fast_forward_remote(root: Path, project: str, state_key: str, remote_dir: str, remote_head: str) -> None:
+    del project
     local_head = repository_head(root)
     if not is_ancestor(root, remote_head, local_head):
         die("local commit history is not a fast-forward of the remote; reconcile it with Git")
     branch = current_branch(root)
-    scan_history(root)
-    with tempfile.TemporaryDirectory(prefix="ompup-commit-bundle-") as bundle_dir:
-        bundle = Path(bundle_dir) / f"{project}.bundle"
-        git(root, "bundle", "create", str(bundle), f"refs/heads/{branch}", capture=False)
-        remote_bundle = f".cache/ompup/{project}.{os.getpid()}.ff.bundle"
-        ssh_command("mkdir -p ~/.cache/ompup")
-        run(["rsync", "-a", str(bundle), f"{REMOTE}:{remote_bundle}"])
-        result = ssh_script(
-            FAST_FORWARD_REMOTE_SCRIPT,
-            remote_dir,
-            remote_bundle,
-            branch,
-            check=False,
-            capture=True,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "remote Git rejected the update"
-            die(f"could not fast-forward remote commits: {detail}")
+    scan_history(root, f"{remote_head}..{local_head}" if remote_head != "0" * 40 else local_head)
+    publish_commit(root, state_key, remote_dir, branch, remote_head, local_head)
     print(f"ompup: fast-forwarded remote commits to {local_head[:10]}")
 
 
-def fast_forward_local(root: Path, project: str, remote_dir: str, remote_head: str) -> None:
+def fast_forward_local(root: Path, project: str, state_key: str, remote_dir: str, remote_head: str) -> None:
+    del project
     local_head = repository_head(root)
-    remote_bundle = f".cache/ompup/{project}.{os.getpid()}.pull.bundle"
-    ssh_command("mkdir -p ~/.cache/ompup")
-    result = ssh_script(
-        CREATE_REMOTE_BUNDLE_SCRIPT,
-        remote_dir,
-        remote_bundle,
+    branch_result = ssh_command(
+        f"git -C {shlex.quote(remote_dir)} symbolic-ref --quiet --short HEAD",
         check=False,
         capture=True,
     )
-    if result.returncode != 0:
-        die("could not create a Git bundle from the remote branch")
-    branch = result.stdout.strip()
+    if branch_result.returncode != 0:
+        die("could not determine the remote branch")
+    branch = branch_result.stdout.strip()
     local_branch = current_branch(root)
     if local_branch != branch:
-        ssh_command(f"rm -f {shlex.quote(remote_bundle)}", check=False)
         die(f"branch mismatch: local={local_branch} remote={branch}")
-    with tempfile.TemporaryDirectory(prefix="ompup-pull-bundle-") as bundle_dir:
-        bundle = Path(bundle_dir) / f"{project}.bundle"
-        try:
-            run(["rsync", "-a", f"{REMOTE}:{remote_bundle}", str(bundle)])
-        finally:
-            ssh_command(f"rm -f {shlex.quote(remote_bundle)}", check=False)
-        git(root, "fetch", "-q", str(bundle), f"refs/heads/{branch}")
-        incoming = git(root, "rev-parse", "FETCH_HEAD")
+
+    local_ref = operation_ref("incoming", state_key)
+    try:
+        fetch_ref(root, remote_repository(remote_dir), f"refs/heads/{branch}", local_ref)
+        incoming = git(root, "rev-parse", f"{local_ref}^{{commit}}")
         if incoming != remote_head or not is_ancestor(root, local_head, incoming):
             die("remote commit history is not a fast-forward of local; reconcile it with Git")
-        temp_ref = "refs/ompup/incoming"
-        git(root, "update-ref", temp_ref, incoming, capture=False)
-        try:
-            scan_history(root)
-        finally:
-            git(root, "update-ref", "-d", temp_ref, capture=False)
+        scan_history(root, f"{local_head}..{incoming}" if local_head != "0" * 40 else incoming)
         git(root, "reset", "--hard", "-q", incoming, capture=False)
+    finally:
+        delete_local_ref(root, local_ref)
     print(f"ompup: fast-forwarded local commits to {incoming[:10]}")
 
 
@@ -590,13 +761,12 @@ def sync_up(
         die("remote working state changed since the last sync; run `ompup pull` or resolve the conflict")
     local_head, remote_head = local.split(":", 1)[0], remote.split(":", 1)[0]
     if local_head != remote_head:
-        fast_forward_remote(root, project, remote_dir, remote_head)
+        fast_forward_remote(root, project, state_key, remote_dir, remote_head)
 
-    with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name:
-        expected = make_local_stage(root, Path(stage_name))
-        if expected != local:
-            die("local checkout changed while its snapshot was being prepared; retry")
-        rsync_stage(Path(stage_name), f"{REMOTE}:{remote_dir}/")
+    expected, tree = prepare_snapshot(root)
+    if expected != local:
+        die("local checkout changed while its snapshot was being prepared; retry")
+    publish_snapshot(root, state_key, remote_dir, expected, tree)
 
     actual = remote_state(remote_dir)
     if actual != local:
@@ -605,27 +775,36 @@ def sync_up(
     print("ompup: synchronized local working state to remote")
 
 
-def download_remote_stage(remote_dir: str, tree: str, stage: Path) -> None:
-    command = "bash -s -- " + " ".join(shlex.quote(value) for value in (remote_dir, tree))
-    with tempfile.NamedTemporaryFile(prefix="ompup-archive-", suffix=".tar") as archive:
-        process = subprocess.Popen(
-            ["ssh", REMOTE, command],
-            stdin=subprocess.PIPE,
-            stdout=archive,
-            stderr=subprocess.PIPE,
+def fetch_snapshot(root: Path, state_key: str, remote_dir: str, state: str) -> None:
+    expected_head, expected_tree = state.split(":", 1)
+    remote_ref = operation_ref("snapshots", state_key)
+    local_ref = operation_ref("incoming", state_key)
+    try:
+        result = ssh_script(
+            CREATE_SNAPSHOT_REF_SCRIPT,
+            remote_dir,
+            expected_head,
+            expected_tree,
+            remote_ref,
+            check=False,
+            capture=True,
         )
-        _, stderr = process.communicate(ARCHIVE_SCRIPT.encode())
-        if process.returncode != 0:
-            die(f"could not archive remote working state: {stderr.decode(errors='replace').strip()}")
-        archive.flush()
-        archive.seek(0)
-        with tarfile.open(fileobj=archive, mode="r:") as tar:
-            for member in tar.getmembers():
-                target = (stage / member.name).resolve()
-                if not target.is_relative_to(stage.resolve()):
-                    die("remote archive contains an unsafe path")
-            tar.extractall(stage, filter="data")
-    scan_snapshot(stage)
+        if result.returncode != 0:
+            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "remote snapshot export failed"
+            die(f"could not export remote working snapshot: {detail}")
+        before = local_state(root)
+        fetch_ref(root, remote_repository(remote_dir), remote_ref, local_ref)
+        incoming = git(root, "rev-parse", f"{local_ref}^{{tree}}")
+        if incoming != expected_tree:
+            die(f"fetched snapshot mismatch: expected={expected_tree} actual={incoming}")
+        scan_snapshot_tree(root, incoming)
+        if local_state(root) != before:
+            die("local checkout changed while the remote snapshot was being fetched; retry")
+        run(["git", "-C", str(root), "read-tree", "--dry-run", "--reset", "-u", incoming])
+        run(["git", "-C", str(root), "read-tree", "--reset", "-u", incoming])
+    finally:
+        delete_local_ref(root, local_ref)
+        delete_remote_ref(remote_dir, remote_ref)
 
 
 def sync_down(root: Path, project: str, state_key: str, remote_dir: str, identity: str) -> None:
@@ -644,14 +823,9 @@ def sync_down(root: Path, project: str, state_key: str, remote_dir: str, identit
         die("both local and remote working states changed since the last sync; resolve the conflict")
     local_head, remote_head = local.split(":", 1)[0], remote.split(":", 1)[0]
     if local_head != remote_head:
-        fast_forward_local(root, project, remote_dir, remote_head)
+        fast_forward_local(root, project, state_key, remote_dir, remote_head)
 
-    tree = remote.split(":", 1)[1]
-    with tempfile.TemporaryDirectory(prefix="ompup-stage-") as stage_name:
-        stage = Path(stage_name)
-        download_remote_stage(remote_dir, tree, stage)
-        rsync_stage(stage, str(root) + os.sep)
-
+    fetch_snapshot(root, state_key, remote_dir, remote)
     actual = local_state(root)
     if actual != remote:
         die("local verification did not match the remote snapshot; synchronization state was not advanced")
@@ -736,7 +910,7 @@ def attach(session: str, remote_dir: str, launch: str, fingerprint: str) -> None
         f"{record_environment}"
         f"exec tmux attach-session -t {quoted_target}"
     )
-    os.execvp("ssh", ["ssh", "-t", REMOTE, command])
+    os.execvp("ssh", ["ssh", *ssh_transport_args(), "-t", REMOTE, command])
 
 
 def add_project_arguments(parser: argparse.ArgumentParser, *, cmux: bool = False) -> None:
@@ -838,8 +1012,10 @@ def validate_local_requirements(args: argparse.Namespace) -> None:
         required = ("ssh", "omp")
     elif args.command == "env":
         required = ("ssh", "omp") if args.env_command == "status" else ("ssh", "omp", "gitleaks")
-    else:
+    elif args.command == "handoff":
         required = ("git", "ssh", "rsync", "gitleaks")
+    else:
+        required = ("git", "ssh", "gitleaks")
     for executable in required:
         if shutil.which(executable) is None:
             die(f"required local command not found: {executable}")
@@ -865,6 +1041,7 @@ def host_context(
     choice = choose_host(hosts, probes, root, profile, explicit)
     remote_dir = choice.probe.remote_dir
     REMOTE = choice.host.ssh
+    configure_ssh_transport(REMOTE)
     LAUNCH = LAUNCH_OVERRIDE or choice.host.launch
     if persist and not pinned_host(root):
         pin_host(root, choice.host.name)
@@ -1004,7 +1181,7 @@ def cmux_caller() -> tuple[str, str] | None:
 
 def handoff_attach_command(session: str) -> str:
     remote_command = f"tmux attach-session -t {shlex.quote('=' + session)}"
-    ssh = " ".join(shlex.quote(part) for part in ("ssh", "-t", REMOTE, remote_command))
+    ssh = shlex.join(["ssh", *ssh_transport_args(), "-t", REMOTE, remote_command])
     return f'{ssh}; exec "$SHELL" -l'
 
 
@@ -1084,6 +1261,7 @@ def handoff_session(
     if artifacts_dir and artifacts_dir.exists() and (not artifacts_dir.is_dir() or artifacts_dir.is_symlink()):
         die("active OMP artifact path is not a regular directory")
     validate_handoff_launch(LAUNCH)
+    require_remote_command("rsync")
     if not args.prepare_only:
         ensure_cmux_runtime()
     if session_exists(session):
@@ -1099,9 +1277,17 @@ def handoff_session(
     ssh_script(PREPARE_HANDOFF_SCRIPT, handoff_dir)
     remote_started = False
     try:
-        run(["rsync", "-a", str(session_file), f"{REMOTE}:{remote_session_file}"])
+        run([*rsync_args(), "-a", "--partial", str(session_file), f"{REMOTE}:{remote_session_file}"])
         if artifacts_dir and artifacts_dir.is_dir():
-            run(["rsync", "-a", str(artifacts_dir) + os.sep, f"{REMOTE}:{handoff_dir}/session/"])
+            run(
+                [
+                    *rsync_args(),
+                    "-a",
+                    "--partial",
+                    str(artifacts_dir) + os.sep,
+                    f"{REMOTE}:{handoff_dir}/session/",
+                ]
+            )
         if file_sha256(session_file) != source_hash:
             die("local OMP session changed during transfer; local OMP was preserved")
 

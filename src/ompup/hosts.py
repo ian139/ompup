@@ -98,7 +98,7 @@ print(json.dumps({
     "disk_free": disk.free,
     "project_exists": project.is_dir(),
     "session_exists": session_check,
-    "tools_ok": all(command_ok(command) for command in ("bash", "git", "rsync", "tmux", "python3")) and omp_check,
+    "tools_ok": all(command_ok(command) for command in ("bash", "git", "tmux", "python3")) and omp_check,
 }))
 '''
 

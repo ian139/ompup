@@ -18,7 +18,7 @@ ompup auth status           # optional: verify a configured credential broker
 ## How it works
 
 ```text
-local Git history ──verified bundle/snapshot──> ~/Projects/<name>
+local Git commits + working-tree objects ────────> ~/Projects/<name>
 local session JSONL + artifacts ──────────────> ~/.local/state/ompup/handoffs/...
                                                          │
                                                    tmux + omp --resume
@@ -26,19 +26,20 @@ local session JSONL + artifacts ──────────────> ~/.l
                                                    cmux SSH surface
 ```
 
-- Git history moves through verified Git bundles. Fast-forward commits transfer automatically in either direction; divergent history fails visibly.
-- A temporary Git index captures tracked files plus untracked, non-ignored files. Dependency directories, build output, ignored files, and sensitive paths stay out of the snapshot.
-- Every successful transfer records the exact Git HEAD and snapshot tree. A later transfer proceeds only when the destination still matches that baseline. Conflicting edits and repository-name collisions fail visibly.
-- The first transfer scans reachable history and every transfer scans its working snapshot with `gitleaks`.
+- Git negotiates commit and working-snapshot objects directly with temporary `refs/ompup/*` references, so subsequent transfers send only objects the destination lacks. Fast-forward commits transfer automatically in either direction; divergent history fails visibly.
+- A temporary Git index captures tracked files plus untracked, non-ignored files as an exact tree without materializing a second filesystem copy. Dependency directories, build output, ignored files, and sensitive paths stay out of the snapshot.
+- Every successful transfer records the exact Git HEAD and snapshot tree. A later transfer proceeds only when the destination still matches that baseline. Temporary transport references are removed after application. Conflicting edits and repository-name collisions fail visibly.
+- The first transfer scans reachable history, each later commit transfer scans only incoming history, and every transferred working tree is represented as a synthetic root commit and scanned with `gitleaks`.
 - An existing tmux session is reattached without synchronizing files beneath the running process. Use `ompup sync` explicitly when you want a later local change transferred.
 - Host selection is sticky. Live capacity chooses the first placement; the project remains pinned until `ompup unpin`.
 - A live handoff waits for OMP to become idle, syncs the project, copies the session and artifacts into a private remote state directory, verifies the checksum and remote export, and starts OMP in tmux. Only then does cmux replace the local surface.
 - In `mirror` mode, an OMP launch or live handoff requires the selected machine to match the generated environment fingerprint and OMP version. Each managed tmux session records the fingerprint it started with. In the default `preserve` mode, ompup verifies that remote OMP launches but does not read or change its configuration.
+- Commands for a selected host reuse a private, process-scoped SSH control connection for 60 seconds. Live-session files and artifacts still use resumable rsync over that connection.
 
 ## Requirements
 
-- Local: Python 3.12 or newer, `ssh`, `rsync`, `git`, and `gitleaks`; mirror mode also requires Mike Farah `yq` v4; cmux is required for live session handoff
-- Remote: Python 3.7 or newer, Bash, `tmux`, `rsync`, `git`, and `omp`
+- Local: Python 3.12 or newer, `ssh`, `git`, and `gitleaks`; live session handoff also requires `rsync`, mirror mode requires Mike Farah `yq` v4, and cmux is required for in-place handoff
+- Remote: Python 3.7 or newer, Bash, `tmux`, `git`, and `omp`; live session handoff also requires `rsync`
 - An SSH host or alias that reaches your box (an entry in `~/.ssh/config` works well)
 
 ## Install
@@ -200,8 +201,8 @@ ompup env status --all
 - Project names resolve from the current Git repository, an explicit path, or a case-insensitive directory under `OMPUP_PROJECTS_ROOT`.
 - The repository directory name also becomes the tmux session name.
 - In sessions created by `ompup up`, quitting omp drops to a remote shell instead of killing tmux.
-- Fast-forward commits transfer automatically. Divergent history requires normal Git reconciliation.
-- `ompup pull` may delete local paths to reproduce the remote snapshot, but only when the local checkout exactly matches the recorded baseline.
+- Fast-forward commits and dirty working trees use negotiated Git object transfer. Divergent history requires normal Git reconciliation.
+- `ompup pull` fetches the remote snapshot as Git objects and may delete local paths when applying its tree, but only when the local checkout exactly matches the recorded baseline.
 - A successful handoff keeps the local session file as a rollback copy. A failed transfer, checksum, remote load, launch, or cmux replacement leaves local OMP running and removes only remote state created by that attempt.
 - Handoff refuses while asynchronous jobs are running because their local processes cannot migrate with the session transcript.
 - Handoff refuses to overwrite an existing project tmux session. Attach that session or select another host.
