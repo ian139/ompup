@@ -38,6 +38,7 @@ new_fixture() {
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH OMPUP_FAKE_SSH_MUTATE_PATH
   unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP OMPUP_FAKE_REMOTE_MV_MUTATE_BEFORE_BACKUP
   unset OMPUP_FAKE_MV_REPLACE_CONTAINER OMPUP_FAKE_MV_REPLACE_STAMP OMPUP_FAKE_MV_REPLACE_TARGET OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
+  unset OMPUP_FAKE_RECOVERY_MV_MUTATE_PATH OMPUP_FAKE_MKDIR_FAIL_STATE
   unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
   unset OMPUP_FAKE_SSH_GIT_COMMIT_STAMP OMPUP_FAKE_SSH_GIT_PROJECT
   unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND
@@ -721,6 +722,51 @@ case_control_pathnames() {
   assert_not_contains "$OUT" $'\177'
 }
 
+case_recovery_move_races() {
+  local rd journal
+
+  new_fixture
+  printf source > "$PROJECT/file.txt"
+  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH=ompup_candidate_promotion
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'initial promotion interruption must fail'
+  rd=$(remote_project); journal=$(transaction_journal); assert_file "$journal"
+  unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
+  export OMPUP_FAKE_RECOVERY_MV_MUTATE_PATH="$rd/file.txt"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'initial recovery move race must block'
+  assert_contains "$OUT" 'initial-sync recovery restored a version changed during recovery move'
+  assert_eq "$(cat "$rd/file.txt")" concurrent
+  assert_file "$journal"
+
+  new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
+  printf desired > "$PROJECT/file.txt"
+  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH=ompup_candidate_promotion
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'initialized promotion interruption must fail'
+  journal=$(transaction_journal); assert_file "$journal"
+  unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
+  export OMPUP_FAKE_RECOVERY_MV_MUTATE_PATH="$rd/file.txt"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'initialized sync recovery move race must block'
+  assert_contains "$OUT" 'sync recovery restored a version changed during recovery move'
+  assert_eq "$(cat "$rd/file.txt")" concurrent
+  assert_file "$journal"
+
+  new_fixture; init_non_git; rd=$(remote_project); printf remote > "$rd/file.txt"
+  export OMPUP_FAKE_MKDIR_FAIL_STATE=1
+  run_ompup pull
+  [ "$RC" -ne 0 ] || fail 'pull state-commit interruption must fail'
+  journal=$(transaction_journal); assert_file "$journal"
+  unset OMPUP_FAKE_MKDIR_FAIL_STATE
+  export OMPUP_FAKE_RECOVERY_MV_MUTATE_PATH="$PROJECT/file.txt"
+  run_ompup pull
+  [ "$RC" -ne 0 ] || fail 'pull recovery move race must block'
+  assert_contains "$OUT" 'pull recovery restored a version changed during recovery move'
+  assert_eq "$(cat "$PROJECT/file.txt")" concurrent
+  assert_file "$journal"
+}
+
 all_cases=(
   help_version initial_non_git initial_git_and_git_boundary round_trip_and_status
   divergent_git dirty_git_boundaries both_side_conflict identity_isolation
@@ -730,7 +776,7 @@ all_cases=(
   rename_gap_recovery promotion_window_conflicts remote_policy_and_secret_defaults
   malicious_state_and_journals cleanup_recovery_and_status_blockers
   initial_sync_third_versions git_metadata_race exclusive_control_creation
-  rules_publication_races container_path_races control_pathnames
+  rules_publication_races container_path_races control_pathnames recovery_move_races
 )
 
 requested=${1:-all}

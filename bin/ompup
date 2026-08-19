@@ -1085,6 +1085,20 @@ recover_transaction() {
           die "pull recovery failed-tree slot is occupied"
         (cd "$candidate_container" && mv -h "$ROOT" failed && [ -d failed ] && [ ! -L failed ] && [ ! -e "$ROOT" ]) ||
           die "pull recovery could not preserve the transaction target; artifacts preserved"
+        validate_tree "$candidate_container/failed"
+        moved_changed=0
+        (require_local_path_git_match "$candidate_container/failed") || moved_changed=1
+        [ -z "$(compare_local "$txn_dir/after" "$candidate_container/failed")" ] || moved_changed=1
+        if [ "$moved_changed" -eq 1 ]; then
+          if [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ]; then
+            (cd "$candidate_container" && mv -h failed "$ROOT" && [ ! -e failed ] && [ -d "$ROOT" ] && [ ! -L "$ROOT" ]) ||
+              die "pull recovery could not restore moved recovery-race version; artifacts preserved"
+            LOCAL_INSPECT_ROOT=$ROOT
+            cd "$ROOT"
+            die "pull recovery restored a version changed during recovery move; transaction artifacts preserved"
+          fi
+          die "pull recovery move raced with an occupied live path; preserved both versions and transaction artifacts"
+        fi
       fi
       [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ] || die "pull recovery live path became occupied"
       (cd "$backup_container" && mv -h tree "$ROOT" && [ ! -e tree ] && [ -d "$ROOT" ] && [ ! -L "$ROOT" ]) ||
@@ -1121,6 +1135,17 @@ recover_transaction() {
         bnonce=$(container_nonce backup "$backup_container")
         ssh_run "set -eu; cd \"\$HOME\"; container=$(sq "$backup_container"); nonce=$(sq "$bnonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce)\" = \"\$nonce\" ]; [ ! -e tree ] && [ ! -L tree ]; [ -d \"\$live\" ] && [ ! -L \"\$live\" ]; mv -h \"\$live\" tree; [ -d tree ] && [ ! -L tree ] && [ ! -e \"\$live\" ]" ||
           die "initial-sync recovery could not preserve transaction target"
+        require_remote_tree "$backup_tree"
+        moved_changed=0
+        (require_remote_path_git_match "$backup_tree") || moved_changed=1
+        [ -z "$(compare_remote "$txn_dir/after" "$backup_tree")" ] || moved_changed=1
+        if [ "$moved_changed" -eq 1 ]; then
+          live_state=$(remote_destination_state) || die "cannot inspect initial-sync recovery live path"
+          if [ "$live_state" = absent ] && remote_restore_backup_if_live_absent "$backup_container"; then
+            die "initial-sync recovery restored a version changed during recovery move; transaction artifacts preserved"
+          fi
+          die "initial-sync recovery move raced with an occupied live path; preserved both versions and transaction artifacts"
+        fi
       fi
       ssh_run "set -eu; cd \"\$HOME\"; marker=$(sq "$REMOTE_CONTROL/marker"); if [ -e \"\$marker\" ] || [ -L \"\$marker\" ]; then [ -f \"\$marker\" ] && [ ! -L \"\$marker\" ]; rm -- \"\$marker\"; fi"
     else
@@ -1136,12 +1161,23 @@ recover_transaction() {
           cnonce=$(container_nonce candidate "$candidate_container")
           ssh_run "set -eu; cd \"\$HOME\"; container=$(sq "$candidate_container"); nonce=$(sq "$cnonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce)\" = \"\$nonce\" ]; [ ! -e failed ] && [ ! -L failed ]; mv -h \"\$live\" failed; [ -d failed ] && [ ! -L failed ] && [ ! -e \"\$live\" ]" ||
             die "sync recovery could not preserve transaction target"
+          require_remote_tree "$candidate_container/failed"
+          moved_changed=0
+          (require_remote_path_git_match "$candidate_container/failed") || moved_changed=1
+          [ -z "$(compare_remote "$txn_dir/after" "$candidate_container/failed")" ] || moved_changed=1
+          if [ "$moved_changed" -eq 1 ]; then
+            live_state=$(remote_destination_state) || die "cannot inspect sync recovery live path"
+            if [ "$live_state" = absent ] && remote_restore_failed_if_live_absent "$candidate_container"; then
+              die "sync recovery restored a version changed during recovery move; transaction artifacts preserved"
+            fi
+            die "sync recovery move raced with an occupied live path; preserved both versions and transaction artifacts"
+          fi
         fi
         remote_restore_backup_if_live_absent "$backup_container" ||
           die "sync recovery backup restore failed; artifacts preserved"
         require_remote_tree "$REMOTE_DIR"
         [ -z "$(compare_remote "$txn_dir/before" "$REMOTE_DIR")" ] || die "sync rollback validation failed; artifacts preserved"
-      fi
+    fi
     fi
     remove_remote_container "$backup_container" backup
     remove_remote_container "$candidate_container" candidate
@@ -1274,6 +1310,11 @@ remote_restore_backup_if_live_absent() {
   local backup_container=$1 backup_nonce
   backup_nonce=$(container_nonce backup "$backup_container")
   ssh_run "set -eu; cd \"\$HOME\"; container=$(sq "$backup_container"); nonce=$(sq "$backup_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ -d tree ] && [ ! -L tree ]; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; mv -h tree \"\$live\"; [ ! -e tree ] && [ ! -L tree ] && [ -d \"\$live\" ] && [ ! -L \"\$live\" ]"
+}
+remote_restore_failed_if_live_absent() {
+  local candidate_container=$1 candidate_nonce
+  candidate_nonce=$(container_nonce candidate "$candidate_container")
+  ssh_run "set -eu; cd \"\$HOME\"; container=$(sq "$candidate_container"); nonce=$(sq "$candidate_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ -d failed ] && [ ! -L failed ]; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; mv -h failed \"\$live\"; [ ! -e failed ] && [ ! -L failed ] && [ -d \"\$live\" ] && [ ! -L \"\$live\" ]"
 }
 remote_promote_candidate() {
   local initialized=$1 candidate_container=$2 candidate_nonce live_nonce

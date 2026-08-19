@@ -9,3 +9,6 @@ case "${OMPUP_FAKE_MKDIR_RULES_ATTACK:-}:$dest" in
   baseline:*'/baselines/'[0-9]*)
     ln -s "$OMPUP_FAKE_MKDIR_RULES_TARGET" "$dest/rules" ;;
 esac
+case "$dest" in
+  */.state-tmp-*) [ "${OMPUP_FAKE_MKDIR_FAIL_STATE:-0}" != 1 ] || exit 99 ;;
+esac
