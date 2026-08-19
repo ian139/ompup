@@ -222,8 +222,9 @@ case_dependency_and_transport_failures() {
   export OMPUP_FAKE_SSH_FAIL=1
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'ssh failure should block'; assert_contains "$OUT" 'remote mutation lock'
   unset OMPUP_FAKE_SSH_FAIL
+  mkdir "$TMP/no-commands"
   set +e
-  OUT=$(env -i PATH=/bin HOME="$TMP" OMPUP_HOST=fixture /bin/bash "$OMPUP" sync 2>&1); RC=$?
+  OUT=$(env -i PATH="$TMP/no-commands" HOME="$TMP" OMPUP_HOST=fixture /bin/bash "$OMPUP" sync 2>&1); RC=$?
   set -e
   [ "$RC" -ne 0 ] || fail 'missing dependency should block'; assert_contains "$OUT" 'required local command not found'
 }
