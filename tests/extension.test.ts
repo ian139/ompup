@@ -293,6 +293,20 @@ describe("defaultRunner", () => {
     await createHandler({ runner: async () => { throw new Error("boom-\x1b]0;bad\x07"); } })("status", c.ctx);
     expect(c.notifications[0]?.message).toContain("boom-\\x1B]0;bad\\x07");
     expect(c.notifications[0]?.message).not.toContain("\x1b");
+    const artifactOutcome: RunOutcome = {
+      kind: "exit",
+      code: 1,
+      stdoutTail: "",
+      stderrTail: "",
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      outputTail: "",
+      outputTruncated: false,
+      artifactPath: "/tmp/ompup-\x1b]0;bad\x07.log",
+    };
+    const artifactMessage = summarize("status", artifactOutcome).message;
+    expect(artifactMessage).toContain("/tmp/ompup-\\x1B]0;bad\\x07.log");
+    expect(artifactMessage).not.toContain("\x1b");
   });
 
   test("retains private complete artifacts whenever success or failure display is truncated", async () => {

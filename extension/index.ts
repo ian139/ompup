@@ -158,7 +158,7 @@ function summarizeError(outcome: Extract<RunOutcome, { kind: "enoent" | "spawn-e
 export function summarize(verb: Verb, outcome: RunOutcome): { message: string; severity: NotificationSeverity } {
   const detail = summarizeDetail(outcome);
   const displayed = detail ? `\n${outcome.outputTruncated ? "…" : ""}${detail}` : "";
-  const artifact = outcome.artifactPath ? `\nFull output: ${outcome.artifactPath}` : "";
+  const artifact = outcome.artifactPath ? `\nFull output: ${sanitizeDisplay(outcome.artifactPath)}` : "";
   if (outcome.kind === "exit") {
     return {
       severity: outcome.code === 0 ? "info" : "error",
