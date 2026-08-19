@@ -721,12 +721,12 @@ rsync_remote_to_local() {
 compare_local() {
   { rsync "${RSYNC_COMMON[@]}" -ni --out-format=$'%i\t%n' "${FILTER_ARGS[@]}" "$1/" "$2/"
     rsync "${RSYNC_COMMON[@]}" -ni --out-format=$'%i\t%n' "${FILTER_ARGS[@]}" "$2/" "$1/"
-  } | sed $'/^\\.d\\.\\.t\\.\\.\\.\\.\\t/d' | sort -u
+  } | sed -e $'/^\\.d\\.\\.t\\.\\.\\.\\.\\t/d' -e $'/^\\.d\\.\\.t\\.\\.\\.\\.\\.\\.\\t/d' | sort -u
 }
 compare_remote() {
   { rsync -e "$SSH_TRANSPORT" "${RSYNC_COMMON[@]}" -ni --out-format=$'%i\t%n' "${FILTER_ARGS[@]}" "$1/" "$HOST:$2/"
     rsync -e "$SSH_TRANSPORT" "${RSYNC_COMMON[@]}" -ni --out-format=$'%i\t%n' "${FILTER_ARGS[@]}" "$HOST:$2/" "$1/"
-  } | sed $'/^\\.d\\.\\.t\\.\\.\\.\\.\\t/d' | sort -u
+  } | sed -e $'/^\\.d\\.\\.t\\.\\.\\.\\.\\t/d' -e $'/^\\.d\\.\\.t\\.\\.\\.\\.\\.\\.\\t/d' | sort -u
 }
 
 LOCAL_CHANGES= REMOTE_CHANGES=
