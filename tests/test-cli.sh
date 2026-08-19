@@ -38,7 +38,8 @@ new_fixture() {
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH OMPUP_FAKE_SSH_MUTATE_PATH
   unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP OMPUP_FAKE_REMOTE_MV_MUTATE_BEFORE_BACKUP
   unset OMPUP_FAKE_MV_REPLACE_CONTAINER OMPUP_FAKE_MV_REPLACE_STAMP OMPUP_FAKE_MV_REPLACE_TARGET OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
-  unset OMPUP_FAKE_MV_CREATE_DEST_DIR OMPUP_FAKE_MV_CREATE_DEST_STAMP
+  unset OMPUP_FAKE_MV_CREATE_DEST_DIR OMPUP_FAKE_MV_CREATE_DEST_STAMP OMPUP_FAKE_MV_LEGACY_MODE
+  unset OMPUP_FAKE_MV_CREATE_MATCH OMPUP_FAKE_MV_CREATE_MATCH_STAMP
   unset OMPUP_FAKE_RECOVERY_MV_MUTATE_PATH OMPUP_FAKE_MKDIR_FAIL_STATE
   unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
   unset OMPUP_FAKE_SSH_GIT_COMMIT_STAMP OMPUP_FAKE_SSH_GIT_PROJECT
@@ -439,6 +440,28 @@ case_remote_policy_and_secret_defaults() {
   assert_no_file "$rd/.git-credentials"; assert_no_file "$rd/.docker/config.json"; assert_no_file "$rd/.kube"
   assert_no_file "$rd/.config/gh/hosts.yml"; assert_no_file "$rd/nested/.docker/config.json"; assert_no_file "$rd/nested/.kube"
   assert_eq "$(cat "$rd/.env.example")" example; assert_eq "$(cat "$rd/.env.sample")" sample
+
+  new_fixture
+  printf 'LOCAL_SECRET_FILTER\n' > "$TMP/local-secret"
+  ln -s "$TMP/local-secret" "$PROJECT/.ompupignore"
+  printf one > "$PROJECT/file.txt"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'local symlink .ompupignore must block'
+  assert_contains "$OUT" 'local .ompupignore must be a regular non-symlink file'
+  assert_not_contains "$OUT" 'LOCAL_SECRET_FILTER'
+  [ -z "$(marker_file 2>/dev/null || true)" ] || fail 'local symlink policy published a marker'
+
+  new_fixture; init_non_git
+  rd=$(remote_project)
+  printf 'REMOTE_SECRET_FILTER\n' > "$REMOTE/private-filter"
+  ln -s "$REMOTE/private-filter" "$rd/.ompupignore"
+  local before
+  before=$(snapshot "$PROJECT")
+  run_ompup pull
+  [ "$RC" -ne 0 ] || fail 'remote symlink .ompupignore must block'
+  assert_contains "$OUT" 'remote .ompupignore must be a regular non-symlink file'
+  assert_not_contains "$OUT" 'REMOTE_SECRET_FILTER'
+  assert_eq "$(snapshot "$PROJECT")" "$before"
 }
 
 case_malicious_state_and_journals() {
@@ -701,6 +724,27 @@ case_container_path_races() {
   assert_contains "$OUT" 'local backup move failed'
   assert_eq "$(snapshot "$PROJECT")" "$before"
   assert_eq "$(cat "$rd/file.txt")" remote-new
+  journal=$(transaction_journal); assert_file "$journal"
+
+  new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
+  printf local-new > "$PROJECT/file.txt"
+  export OMPUP_FAKE_MV_LEGACY_MODE=1
+  export OMPUP_FAKE_MV_CREATE_DEST_DIR=1 OMPUP_FAKE_MV_CREATE_DEST_STAMP="$TMP/remote-nested-forward"
+  export OMPUP_FAKE_MV_CREATE_MATCH="/Projects/${rd##*/}" OMPUP_FAKE_MV_CREATE_MATCH_STAMP="$TMP/remote-nested-rollback"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'nested remote rollback race must block'
+  assert_contains "$OUT" 'exact-move rollback target changed; source preserved at'
+  assert_eq "$(cat "$rd/${rd##*/}/file.txt")" one
+  journal=$(transaction_journal); assert_file "$journal"
+
+  new_fixture; init_non_git; rd=$(remote_project); printf remote-new > "$rd/file.txt"
+  export OMPUP_FAKE_MV_LEGACY_MODE=1
+  export OMPUP_FAKE_MV_CREATE_DEST_DIR=1 OMPUP_FAKE_MV_CREATE_DEST_STAMP="$TMP/local-nested-forward"
+  export OMPUP_FAKE_MV_CREATE_MATCH="/local/${PROJECT##*/}" OMPUP_FAKE_MV_CREATE_MATCH_STAMP="$TMP/local-nested-rollback"
+  run_ompup pull
+  [ "$RC" -ne 0 ] || fail 'nested local rollback race must block'
+  assert_contains "$OUT" 'exact-move rollback target changed; source preserved at'
+  assert_eq "$(cat "$PROJECT/${PROJECT##*/}/file.txt")" one
   journal=$(transaction_journal); assert_file "$journal"
 }
 

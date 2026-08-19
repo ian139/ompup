@@ -140,13 +140,20 @@ tracked_move() (
   printf '%s' "$actual"
 )
 move_exact() {
-  local source destination actual
+  local source destination actual rollback_actual
   source=$(absolute_slot "$1") || return 1
   destination=$(absolute_slot "$2") || return 1
   actual=$(tracked_move "$source" "$destination") || return 1
   [ "$actual" = "$destination" ] && return 0
   if [ ! -e "$source" ] && [ ! -L "$source" ]; then
-    tracked_move "$actual" "$source" >/dev/null || return 1
+    if ! rollback_actual=$(tracked_move "$actual" "$source"); then
+      printf 'ompup: exact-move rollback failed; source may remain at %s\n' "$actual" >&2
+      return 1
+    fi
+    if [ "$rollback_actual" != "$source" ]; then
+      printf 'ompup: exact-move rollback target changed; source preserved at %s\n' "$rollback_actual" >&2
+      return 1
+    fi
   fi
   return 1
 }
@@ -225,7 +232,7 @@ sq() {
   local value=$1
   printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
 }
-REMOTE_MOVE_EXACT='move_platform() { if mv --help 2>&1 | grep -q -- "--no-target-directory"; then mv -T "$1" "$2"; else mv -h "$1" "$2"; fi; }; absolute_slot() { local path=$1 parent name physical; case "$path" in */*) parent=${path%/*}; name=${path##*/}; [ -n "$parent" ] || parent=/ ;; *) parent=.; name=$path ;; esac; physical=$(cd "$parent" && pwd -P) || return 1; if [ "$physical" = / ]; then printf "/%s" "$name"; else printf "%s/%s" "$physical" "$name"; fi; }; tracked_move() ( local source=$1 destination=$2 tracker tracker_pid= moved=0 actual; tracker=$(mktemp -d "${TMPDIR:-/tmp}/ompup-move.XXXXXX") || return 1; trap '"'"'[ -z "$tracker_pid" ] || kill "$tracker_pid" 2>/dev/null || true; rm -rf "$tracker"'"'"' EXIT HUP INT TERM; ( cd "$source" || exit 1; : > "$tracker/ready"; while [ ! -e "$tracker/go" ]; do :; done; pwd -P > "$tracker/actual"; ) & tracker_pid=$!; while [ ! -e "$tracker/ready" ]; do kill -0 "$tracker_pid" 2>/dev/null || { wait "$tracker_pid" || true; return 1; }; done; if move_platform "$source" "$destination"; then moved=1; fi; : > "$tracker/go"; wait "$tracker_pid" || return 1; tracker_pid=; IFS= read -r actual < "$tracker/actual" || return 1; [ "$moved" -eq 1 ] || return 1; printf "%s" "$actual"; ); move_exact() { local source destination actual; source=$(absolute_slot "$1") || return 1; destination=$(absolute_slot "$2") || return 1; actual=$(tracked_move "$source" "$destination") || return 1; [ "$actual" = "$destination" ] && return 0; if [ ! -e "$source" ] && [ ! -L "$source" ]; then tracked_move "$actual" "$source" >/dev/null || return 1; fi; return 1; }'
+REMOTE_MOVE_EXACT='move_platform() { if mv --help 2>&1 | grep -q -- "--no-target-directory"; then mv -T "$1" "$2"; else mv -h "$1" "$2"; fi; }; absolute_slot() { local path=$1 parent name physical; case "$path" in */*) parent=${path%/*}; name=${path##*/}; [ -n "$parent" ] || parent=/ ;; *) parent=.; name=$path ;; esac; physical=$(cd "$parent" && pwd -P) || return 1; if [ "$physical" = / ]; then printf "/%s" "$name"; else printf "%s/%s" "$physical" "$name"; fi; }; tracked_move() ( local source=$1 destination=$2 tracker tracker_pid= moved=0 actual; tracker=$(mktemp -d "${TMPDIR:-/tmp}/ompup-move.XXXXXX") || return 1; trap '"'"'[ -z "$tracker_pid" ] || kill "$tracker_pid" 2>/dev/null || true; rm -rf "$tracker"'"'"' EXIT HUP INT TERM; ( cd "$source" || exit 1; : > "$tracker/ready"; while [ ! -e "$tracker/go" ]; do :; done; pwd -P > "$tracker/actual"; ) & tracker_pid=$!; while [ ! -e "$tracker/ready" ]; do kill -0 "$tracker_pid" 2>/dev/null || { wait "$tracker_pid" || true; return 1; }; done; if move_platform "$source" "$destination"; then moved=1; fi; : > "$tracker/go"; wait "$tracker_pid" || return 1; tracker_pid=; IFS= read -r actual < "$tracker/actual" || return 1; [ "$moved" -eq 1 ] || return 1; printf "%s" "$actual"; ); move_exact() { local source destination actual rollback_actual; source=$(absolute_slot "$1") || return 1; destination=$(absolute_slot "$2") || return 1; actual=$(tracked_move "$source" "$destination") || return 1; [ "$actual" = "$destination" ] && return 0; if [ ! -e "$source" ] && [ ! -L "$source" ]; then if ! rollback_actual=$(tracked_move "$actual" "$source"); then printf "ompup: exact-move rollback failed; source may remain at %s\n" "$actual" >&2; return 1; fi; if [ "$rollback_actual" != "$source" ]; then printf "ompup: exact-move rollback target changed; source preserved at %s\n" "$rollback_actual" >&2; return 1; fi; fi; return 1; }'
 ssh_run() {
   local script=$1
   ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "bash -c $(sq "$script")"
@@ -420,9 +427,12 @@ add_extra_filters() {
 build_filters() {
   FILTER_KINDS=(); FILTER_RULES=()
   add_default_filters
-  if [ -f "$LOCAL_INSPECT_ROOT/.ompupignore" ]; then
+  local ignore_path="$LOCAL_INSPECT_ROOT/.ompupignore"
+  if [ -e "$ignore_path" ] || [ -L "$ignore_path" ]; then
+    [ -f "$ignore_path" ] && [ ! -L "$ignore_path" ] ||
+      die "local .ompupignore must be a regular non-symlink file"
     local local_ignore
-    local_ignore=$(cat "$LOCAL_INSPECT_ROOT/.ompupignore")
+    local_ignore=$(cat "$ignore_path") || die "cannot read local .ompupignore"
     add_ignore_text "$local_ignore" ".ompupignore"
   fi
   add_extra_filters
@@ -1460,8 +1470,8 @@ pull_real() {
   acquire_locks
   read_state; recover_transaction; read_state; require_marker; require_remote_tree "$REMOTE_DIR"; require_git_match; compute_changes
   require_effective_owner remote
-  remote_ignore=$(ssh_read "cd \"\$HOME\"; cat $(sq "$REMOTE_DIR/.ompupignore") 2>/dev/null || true") ||
-    die "cannot read remote exclusion policy"
+  remote_ignore=$(ssh_read "set -eu; cd \"\$HOME\"; path=$(sq "$REMOTE_DIR/.ompupignore"); if [ -e \"\$path\" ] || [ -L \"\$path\" ]; then [ -f \"\$path\" ] && [ ! -L \"\$path\" ] || { echo 'BLOCK:remote .ompupignore must be a regular non-symlink file' >&2; exit 2; }; cat \"\$path\"; fi") ||
+    die "cannot safely read remote exclusion policy"
   FILTER_KINDS=(); FILTER_RULES=(); RULES_TEXT=
   add_default_filters
   add_ignore_text "$remote_ignore" "remote .ompupignore"

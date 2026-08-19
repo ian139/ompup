@@ -6,11 +6,22 @@ for arg in "$@"; do
   dest=$arg
   case "$arg" in -h|-T) exact_move=1 ;; esac
 done
+if [ "$dest" = --help ] && [ "${OMPUP_FAKE_MV_LEGACY_MODE:-0}" = 1 ]; then
+  exit 1
+fi
 dest_base=${dest##*/}
 if [ "$exact_move" -eq 1 ] && [ "${OMPUP_FAKE_MV_CREATE_DEST_DIR:-0}" = 1 ] && [ ! -e "$OMPUP_FAKE_MV_CREATE_DEST_STAMP" ]; then
   : > "$OMPUP_FAKE_MV_CREATE_DEST_STAMP"
   /bin/mkdir "$dest"
   printf 'concurrent\n' > "$dest/.ompup-race"
+fi
+if [ "$exact_move" -eq 1 ] && [ -n "${OMPUP_FAKE_MV_CREATE_MATCH:-}" ] && [ ! -e "$OMPUP_FAKE_MV_CREATE_MATCH_STAMP" ]; then
+  case "$dest" in
+    *"$OMPUP_FAKE_MV_CREATE_MATCH"*)
+      : > "$OMPUP_FAKE_MV_CREATE_MATCH_STAMP"
+      /bin/mkdir "$dest"
+      printf 'concurrent rollback\n' > "$dest/.ompup-race" ;;
+  esac
 fi
 if [ "${OMPUP_FAKE_MV_REPLACE_CONTAINER:-0}" = 1 ] && [ ! -e "$OMPUP_FAKE_MV_REPLACE_STAMP" ]; then
   cwd=$(pwd -P)
