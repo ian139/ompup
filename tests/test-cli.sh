@@ -38,6 +38,7 @@ new_fixture() {
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH OMPUP_FAKE_SSH_MUTATE_PATH
   unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP OMPUP_FAKE_REMOTE_MV_MUTATE_BEFORE_BACKUP
   unset OMPUP_FAKE_MV_REPLACE_CONTAINER OMPUP_FAKE_MV_REPLACE_STAMP OMPUP_FAKE_MV_REPLACE_TARGET OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
+  unset OMPUP_FAKE_MV_CREATE_DEST_DIR OMPUP_FAKE_MV_CREATE_DEST_STAMP
   unset OMPUP_FAKE_RECOVERY_MV_MUTATE_PATH OMPUP_FAKE_MKDIR_FAIL_STATE
   unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
   unset OMPUP_FAKE_SSH_GIT_COMMIT_STAMP OMPUP_FAKE_SSH_GIT_PROJECT
@@ -638,7 +639,7 @@ case_rules_publication_races() {
 }
 
 case_container_path_races() {
-  local sentinel before rd
+  local sentinel before rd journal
 
   new_fixture
   sentinel="$TMP/remote-candidate-container-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
@@ -682,6 +683,25 @@ case_container_path_races() {
   run_ompup pull
   [ "$RC" -ne 0 ] || fail 'replaced local backup container must block'
   assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
+  printf local-new > "$PROJECT/file.txt"; before=$(snapshot "$rd")
+  export OMPUP_FAKE_MV_CREATE_DEST_DIR=1 OMPUP_FAKE_MV_CREATE_DEST_STAMP="$TMP/remote-destination-directory"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'racing real remote backup directory must block'
+  assert_contains "$OUT" 'remote backup move failed'
+  assert_eq "$(snapshot "$rd")" "$before"
+  assert_eq "$(cat "$PROJECT/file.txt")" local-new
+  journal=$(transaction_journal); assert_file "$journal"
+
+  new_fixture; init_non_git; rd=$(remote_project); printf remote-new > "$rd/file.txt"; before=$(snapshot "$PROJECT")
+  export OMPUP_FAKE_MV_CREATE_DEST_DIR=1 OMPUP_FAKE_MV_CREATE_DEST_STAMP="$TMP/local-destination-directory"
+  run_ompup pull
+  [ "$RC" -ne 0 ] || fail 'racing real local backup directory must block'
+  assert_contains "$OUT" 'local backup move failed'
+  assert_eq "$(snapshot "$PROJECT")" "$before"
+  assert_eq "$(cat "$rd/file.txt")" remote-new
+  journal=$(transaction_journal); assert_file "$journal"
 }
 
 case_control_pathnames() {

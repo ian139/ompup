@@ -107,7 +107,49 @@ need rsync
 need mv
 MV_NO_TARGET_FLAG=-h
 if mv --help 2>&1 | grep -q -- '--no-target-directory'; then MV_NO_TARGET_FLAG=-T; fi
-move_exact() { mv "$MV_NO_TARGET_FLAG" "$@"; }
+absolute_slot() {
+  local path=$1 parent name physical
+  case "$path" in
+    */*) parent=${path%/*}; name=${path##*/}; [ -n "$parent" ] || parent=/ ;;
+    *) parent=.; name=$path ;;
+  esac
+  physical=$(cd "$parent" && pwd -P) || return 1
+  if [ "$physical" = / ]; then printf '/%s' "$name"; else printf '%s/%s' "$physical" "$name"; fi
+}
+move_platform() { mv "$MV_NO_TARGET_FLAG" "$1" "$2"; }
+tracked_move() (
+  local source=$1 destination=$2 tracker tracker_pid= moved=0 actual
+  tracker=$(mktemp -d "${TMPDIR:-/tmp}/ompup-move.XXXXXX") || return 1
+  trap '[ -z "$tracker_pid" ] || kill "$tracker_pid" 2>/dev/null || true; rm -rf "$tracker"' EXIT HUP INT TERM
+  (
+    cd "$source" || exit 1
+    : > "$tracker/ready"
+    while [ ! -e "$tracker/go" ]; do :; done
+    pwd -P > "$tracker/actual"
+  ) &
+  tracker_pid=$!
+  while [ ! -e "$tracker/ready" ]; do
+    kill -0 "$tracker_pid" 2>/dev/null || { wait "$tracker_pid" || true; return 1; }
+  done
+  if move_platform "$source" "$destination"; then moved=1; fi
+  : > "$tracker/go"
+  wait "$tracker_pid" || return 1
+  tracker_pid=
+  IFS= read -r actual < "$tracker/actual" || return 1
+  [ "$moved" -eq 1 ] || return 1
+  printf '%s' "$actual"
+)
+move_exact() {
+  local source destination actual
+  source=$(absolute_slot "$1") || return 1
+  destination=$(absolute_slot "$2") || return 1
+  actual=$(tracked_move "$source" "$destination") || return 1
+  [ "$actual" = "$destination" ] && return 0
+  if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+    tracked_move "$actual" "$source" >/dev/null || return 1
+  fi
+  return 1
+}
 STATE_ANCHOR=${XDG_STATE_HOME:-$HOME/.local/state}
 STATE_BASE="$STATE_ANCHOR/ompup"
 
@@ -183,6 +225,7 @@ sq() {
   local value=$1
   printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
 }
+REMOTE_MOVE_EXACT='move_platform() { if mv --help 2>&1 | grep -q -- "--no-target-directory"; then mv -T "$1" "$2"; else mv -h "$1" "$2"; fi; }; absolute_slot() { local path=$1 parent name physical; case "$path" in */*) parent=${path%/*}; name=${path##*/}; [ -n "$parent" ] || parent=/ ;; *) parent=.; name=$path ;; esac; physical=$(cd "$parent" && pwd -P) || return 1; if [ "$physical" = / ]; then printf "/%s" "$name"; else printf "%s/%s" "$physical" "$name"; fi; }; tracked_move() ( local source=$1 destination=$2 tracker tracker_pid= moved=0 actual; tracker=$(mktemp -d "${TMPDIR:-/tmp}/ompup-move.XXXXXX") || return 1; trap '"'"'[ -z "$tracker_pid" ] || kill "$tracker_pid" 2>/dev/null || true; rm -rf "$tracker"'"'"' EXIT HUP INT TERM; ( cd "$source" || exit 1; : > "$tracker/ready"; while [ ! -e "$tracker/go" ]; do :; done; pwd -P > "$tracker/actual"; ) & tracker_pid=$!; while [ ! -e "$tracker/ready" ]; do kill -0 "$tracker_pid" 2>/dev/null || { wait "$tracker_pid" || true; return 1; }; done; if move_platform "$source" "$destination"; then moved=1; fi; : > "$tracker/go"; wait "$tracker_pid" || return 1; tracker_pid=; IFS= read -r actual < "$tracker/actual" || return 1; [ "$moved" -eq 1 ] || return 1; printf "%s" "$actual"; ); move_exact() { local source destination actual; source=$(absolute_slot "$1") || return 1; destination=$(absolute_slot "$2") || return 1; actual=$(tracked_move "$source" "$destination") || return 1; [ "$actual" = "$destination" ] && return 0; if [ ! -e "$source" ] && [ ! -L "$source" ]; then tracked_move "$actual" "$source" >/dev/null || return 1; fi; return 1; }'
 ssh_run() {
   local script=$1
   ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "bash -c $(sq "$script")"
@@ -1137,7 +1180,7 @@ recover_transaction() {
         [ -z "$(compare_remote "$txn_dir/after" "$REMOTE_DIR")" ] ||
           die "initial-sync recovery found a third remote version; preserving live tree and transaction artifacts"
         bnonce=$(container_nonce backup "$backup_container")
-        ssh_run "set -eu; cd \"\$HOME\"; container=$(sq "$backup_container"); nonce=$(sq "$bnonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce)\" = \"\$nonce\" ]; [ ! -e tree ] && [ ! -L tree ]; [ -d \"\$live\" ] && [ ! -L \"\$live\" ]; if mv --help 2>&1 | grep -q -- '--no-target-directory'; then mv -T \"\$live\" tree; else mv -h \"\$live\" tree; fi; [ -d tree ] && [ ! -L tree ] && [ ! -e \"\$live\" ]" ||
+        ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; container=$(sq "$backup_container"); nonce=$(sq "$bnonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce)\" = \"\$nonce\" ]; [ ! -e tree ] && [ ! -L tree ]; [ -d \"\$live\" ] && [ ! -L \"\$live\" ]; move_exact \"\$live\" tree; [ -d tree ] && [ ! -L tree ] && [ ! -e \"\$live\" ]" ||
           die "initial-sync recovery could not preserve transaction target"
         require_remote_tree "$backup_tree"
         moved_changed=0
@@ -1163,7 +1206,7 @@ recover_transaction() {
           [ -z "$(compare_remote "$txn_dir/after" "$REMOTE_DIR")" ] ||
             die "sync recovery found a third remote version; preserving both versions and transaction artifacts"
           cnonce=$(container_nonce candidate "$candidate_container")
-          ssh_run "set -eu; cd \"\$HOME\"; container=$(sq "$candidate_container"); nonce=$(sq "$cnonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce)\" = \"\$nonce\" ]; [ ! -e failed ] && [ ! -L failed ]; if mv --help 2>&1 | grep -q -- '--no-target-directory'; then mv -T \"\$live\" failed; else mv -h \"\$live\" failed; fi; [ -d failed ] && [ ! -L failed ] && [ ! -e \"\$live\" ]" ||
+          ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; container=$(sq "$candidate_container"); nonce=$(sq "$cnonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce)\" = \"\$nonce\" ]; [ ! -e failed ] && [ ! -L failed ]; move_exact \"\$live\" failed; [ -d failed ] && [ ! -L failed ] && [ ! -e \"\$live\" ]" ||
             die "sync recovery could not preserve transaction target"
           require_remote_tree "$candidate_container/failed"
           moved_changed=0
@@ -1307,18 +1350,18 @@ remote_prepare_backup() {
   local initialized=$1 backup_container=$2 backup_nonce
   [ "$initialized" -eq 1 ] || return 0
   backup_nonce=$(container_nonce backup "$backup_container")
-  ssh_run "set -eu; cd \"\$HOME\"; : ompup_backup_move; container=$(sq "$backup_container"); nonce=$(sq "$backup_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ ! -e tree ] && [ ! -L tree ]; [ -d \"\$live\" ] && [ ! -L \"\$live\" ]; if mv --help 2>&1 | grep -q -- '--no-target-directory'; then mv -T \"\$live\" tree; else mv -h \"\$live\" tree; fi; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ] && [ -d tree ] && [ ! -L tree ]" ||
+  ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; : ompup_backup_move; container=$(sq "$backup_container"); nonce=$(sq "$backup_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ ! -e tree ] && [ ! -L tree ]; [ -d \"\$live\" ] && [ ! -L \"\$live\" ]; move_exact \"\$live\" tree; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ] && [ -d tree ] && [ ! -L tree ]" ||
     die "remote backup move failed; journal retained for recovery"
 }
 remote_restore_backup_if_live_absent() {
   local backup_container=$1 backup_nonce
   backup_nonce=$(container_nonce backup "$backup_container")
-  ssh_run "set -eu; cd \"\$HOME\"; container=$(sq "$backup_container"); nonce=$(sq "$backup_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ -d tree ] && [ ! -L tree ]; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; if mv --help 2>&1 | grep -q -- '--no-target-directory'; then mv -T tree \"\$live\"; else mv -h tree \"\$live\"; fi; [ ! -e tree ] && [ ! -L tree ] && [ -d \"\$live\" ] && [ ! -L \"\$live\" ]"
+  ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; container=$(sq "$backup_container"); nonce=$(sq "$backup_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ -d tree ] && [ ! -L tree ]; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; move_exact tree \"\$live\"; [ ! -e tree ] && [ ! -L tree ] && [ -d \"\$live\" ] && [ ! -L \"\$live\" ]"
 }
 remote_restore_failed_if_live_absent() {
   local candidate_container=$1 candidate_nonce
   candidate_nonce=$(container_nonce candidate "$candidate_container")
-  ssh_run "set -eu; cd \"\$HOME\"; container=$(sq "$candidate_container"); nonce=$(sq "$candidate_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ -d failed ] && [ ! -L failed ]; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; if mv --help 2>&1 | grep -q -- '--no-target-directory'; then mv -T failed \"\$live\"; else mv -h failed \"\$live\"; fi; [ ! -e failed ] && [ ! -L failed ] && [ -d \"\$live\" ] && [ ! -L \"\$live\" ]"
+  ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; container=$(sq "$candidate_container"); nonce=$(sq "$candidate_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ -d failed ] && [ ! -L failed ]; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; move_exact failed \"\$live\"; [ ! -e failed ] && [ ! -L failed ] && [ -d \"\$live\" ] && [ ! -L \"\$live\" ]"
 }
 remote_promote_candidate() {
   local initialized=$1 candidate_container=$2 candidate_nonce live_nonce
