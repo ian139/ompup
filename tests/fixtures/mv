@@ -2,9 +2,19 @@
 set -eu
 dest=
 for arg in "$@"; do dest=$arg; done
-if [ "$dest" = tree ] && { [ -n "${OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP:-}" ] || [ "${OMPUP_FAKE_MV_FAIL_AFTER_BACKUP:-0}" = 1 ]; }; then
-  if [ -n "${OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP:-}" ]; then
-    printf 'concurrent\n' > "$OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP"
+if [ "${OMPUP_FAKE_MV_REPLACE_CONTAINER:-0}" = 1 ] && [ ! -e "$OMPUP_FAKE_MV_REPLACE_STAMP" ]; then
+  cwd=$(pwd -P)
+  case "$cwd" in
+    */.ompup-backup-*)
+      : > "$OMPUP_FAKE_MV_REPLACE_STAMP"
+      /bin/mv "$cwd" "$cwd.displaced"
+      ln -s "$OMPUP_FAKE_MV_REPLACE_TARGET" "$cwd" ;;
+  esac
+fi
+mutate_path=${OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP:-${OMPUP_FAKE_REMOTE_MV_MUTATE_BEFORE_BACKUP:-}}
+if [ "$dest" = tree ] && { [ -n "$mutate_path" ] || [ "${OMPUP_FAKE_MV_FAIL_AFTER_BACKUP:-0}" = 1 ]; }; then
+  if [ -n "$mutate_path" ]; then
+    printf 'concurrent\n' > "$mutate_path"
   fi
   /bin/mv "$@"
   [ "${OMPUP_FAKE_MV_FAIL_AFTER_BACKUP:-0}" != 1 ] || exit 99

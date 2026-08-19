@@ -36,7 +36,8 @@ new_fixture() {
   export OMPUP_FAKE_REMOTE_HOME="$REMOTE" XDG_STATE_HOME="$STATE" OMPUP_FAKE_SSH_LOG="$LOG"
   unset OMPUP_EXCLUDES OMPUP_CMD OMPUP_FAKE_SSH_FAIL OMPUP_FAKE_SSH_FAIL_MATCH
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH OMPUP_FAKE_SSH_MUTATE_PATH
-  unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
+  unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP OMPUP_FAKE_REMOTE_MV_MUTATE_BEFORE_BACKUP
+  unset OMPUP_FAKE_MV_REPLACE_CONTAINER OMPUP_FAKE_MV_REPLACE_STAMP OMPUP_FAKE_MV_REPLACE_TARGET OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
   unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
   unset OMPUP_FAKE_SSH_GIT_COMMIT_STAMP OMPUP_FAKE_SSH_GIT_PROJECT
   unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND
@@ -244,8 +245,8 @@ case_recovery_and_rollback() {
   new_fixture; init_non_git
   local rd; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
   printf 'pre\n' > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_FAIL_MATCH='ompup_backup_copy'
-  run_ompup sync; [ "$RC" -ne 0 ] || fail 'injected backup copy failure should fail'; assert_eq "$(cat "$rd/file.txt")" one
+  export OMPUP_FAKE_SSH_FAIL_MATCH='ompup_backup_move'
+  run_ompup sync; [ "$RC" -ne 0 ] || fail 'injected backup move failure should fail'; assert_eq "$(cat "$rd/file.txt")" one
   unset OMPUP_FAKE_SSH_FAIL_MATCH
   run_ompup sync; assert_eq "$RC" 0; assert_contains "$OUT" 'recovered uncommitted transaction'; assert_eq "$(cat "$rd/file.txt")" pre
   [ -z "$(find "$STATE" "$REMOTE" -type f -name journal -print)" ] || fail 'journals not cleaned'
@@ -358,48 +359,46 @@ case_rename_gap_recovery() {
   local rd backup
   rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
   printf 'local handoff\n' > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_copy'
-  run_ompup sync; [ "$RC" -ne 0 ] || fail 'sync backup-copy gap injection should fail'
-  assert_eq "$(cat "$rd/file.txt")" one
+  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_move'
+  run_ompup sync; [ "$RC" -ne 0 ] || fail 'sync backup-move gap injection should fail'
+  assert_no_file "$rd"
   backup=$(find "$REMOTE/Projects" -maxdepth 1 -type d -name '.ompup-backup-*' -print -quit)
-  [ -n "$backup" ] || fail 'sync backup-copy artifact missing'
+  [ -n "$backup" ] || fail 'sync backup-move artifact missing'
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
   run_ompup sync; assert_eq "$RC" 0; assert_contains "$OUT" 'recovered uncommitted transaction'
   rd=$(remote_project); assert_eq "$(cat "$rd/file.txt")" 'local handoff'
 
   new_fixture; init_non_git
   rd=$(remote_project); printf 'remote handoff\n' > "$rd/file.txt"
-  export OMPUP_FAKE_CP_FAIL_AFTER_BACKUP=1
-  run_ompup pull; [ "$RC" -ne 0 ] || fail 'pull backup-copy gap injection should fail'
+  export OMPUP_FAKE_MV_FAIL_AFTER_BACKUP=1
+  run_ompup pull; [ "$RC" -ne 0 ] || fail 'pull backup-move gap injection should fail'
   backup=$(find "$TMP/local" -maxdepth 1 -type d -name '.ompup-backup-*' -print -quit)
-  [ -n "$backup" ] || fail 'pull backup-copy artifact missing'
-  unset OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
+  [ -n "$backup" ] || fail 'pull backup-move artifact missing'
+  unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP
   run_ompup_from "$backup/tree" pull; assert_eq "$RC" 0
   assert_contains "$OUT" 'recovered uncommitted transaction'; assert_eq "$(cat "$PROJECT/file.txt")" 'remote handoff'
 
   new_fixture; init_git
   rd=$(remote_project); printf 'git remote handoff\n' > "$rd/file.txt"
-  export OMPUP_FAKE_CP_FAIL_AFTER_BACKUP=1
-  run_ompup pull; [ "$RC" -ne 0 ] || fail 'Git pull backup-copy gap injection should fail'
+  export OMPUP_FAKE_MV_FAIL_AFTER_BACKUP=1
+  run_ompup pull; [ "$RC" -ne 0 ] || fail 'Git pull backup-move gap injection should fail'
   backup=$(find "$TMP/local" -maxdepth 1 -type d -name '.ompup-backup-*' -print -quit)
-  [ -n "$backup" ] || fail 'Git pull backup-copy artifact missing'
-  unset OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
+  [ -n "$backup" ] || fail 'Git pull backup-move artifact missing'
+  unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP
   run_ompup_from "$backup/tree" pull; assert_eq "$RC" 0
   assert_contains "$OUT" 'recovered uncommitted transaction'; assert_eq "$(cat "$PROJECT/file.txt")" 'git remote handoff'
 }
 
 case_promotion_window_conflicts() {
   new_fixture; init_non_git
-  local rd before_epoch backup
+  local rd before_epoch
   rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
   before_epoch=$(sed -n 's/^epoch	//p' "$(state_file)")
   printf 'desired local\n' > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH='/txn/'
-  export OMPUP_FAKE_SSH_MUTATE_PATH="$rd/file.txt"
+  export OMPUP_FAKE_REMOTE_MV_MUTATE_BEFORE_BACKUP="$rd/file.txt"
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'remote promotion-window write must block'
-  assert_contains "$OUT" 'changed during backup copy'
-  backup=$(find "$REMOTE/Projects" -type f -path '*/.ompup-backup-*/tree/file.txt' -print -quit)
-  assert_eq "$(cat "$backup")" concurrent
+  assert_contains "$OUT" 'changed during backup move'
+  assert_eq "$(cat "$rd/file.txt")" concurrent
   assert_eq "$(sed -n 's/^epoch	//p' "$(state_file)")" "$before_epoch"
 
   new_fixture; init_non_git
@@ -407,9 +406,8 @@ case_promotion_window_conflicts() {
   before_epoch=$(sed -n 's/^epoch	//p' "$(state_file)")
   export OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP="$PROJECT/file.txt"
   run_ompup pull; [ "$RC" -ne 0 ] || fail 'local promotion-window write must block'
-  assert_contains "$OUT" 'changed during backup copy'
-  backup=$(find "$TMP/local" -type f -path '*/.ompup-backup-*/tree/file.txt' -print -quit)
-  assert_eq "$(cat "$backup")" concurrent
+  assert_contains "$OUT" 'changed during backup move'
+  assert_eq "$(cat "$PROJECT/file.txt")" concurrent
   assert_eq "$(sed -n 's/^epoch	//p' "$(state_file)")" "$before_epoch"
 }
 
@@ -449,7 +447,7 @@ case_malicious_state_and_journals() {
   assert_contains "$OUT" 'invalid state baseline epoch'; assert_eq "$(cat "$victim/value")" safe
 
   new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
-  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_copy'
+  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_move'
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'journal setup should interrupt'
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
   journal=$(transaction_journal); replace_field "$journal" target_epoch 0003
@@ -457,7 +455,7 @@ case_malicious_state_and_journals() {
   assert_contains "$OUT" 'invalid transaction target epoch'
 
   new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
-  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_copy'
+  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_move'
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'journal setup should interrupt'
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
   journal=$(transaction_journal); printf 'unexpected\tfield\n' >> "$journal"
@@ -465,7 +463,7 @@ case_malicious_state_and_journals() {
   assert_contains "$OUT" 'unknown transaction journal field'
 
   new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
-  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_copy'
+  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_move'
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'journal setup should interrupt'
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
   journal=$(transaction_journal); target=$(sed -n 's/^target_epoch	//p' "$journal")
@@ -552,7 +550,7 @@ case_git_metadata_race() {
   unset OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
   run_ompup sync
   [ "$RC" -ne 0 ] || fail 'Git divergence after rollback must remain blocked'
-  assert_contains "$OUT" 'remote Git tuple diverged'
+  assert_contains "$OUT" 'occupied live path and moved third backup'
   assert_eq "$(snapshot "$rd")" "$before_remote"
 }
 
@@ -661,7 +659,7 @@ case_container_path_races() {
   new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
   sentinel="$TMP/remote-backup-tree-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
   printf local > "$PROJECT/file"
-  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH=ompup_backup_copy
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH=ompup_backup_move
   export OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND=backup_tree OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET="$sentinel"
   run_ompup sync
   [ "$RC" -ne 0 ] || fail 'precreated remote backup tree symlink must block'
@@ -677,8 +675,8 @@ case_container_path_races() {
 
   new_fixture; init_non_git; rd=$(remote_project); printf remote > "$rd/file.txt"
   sentinel="$TMP/local-backup-container-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
-  export OMPUP_FAKE_CP_REPLACE_CONTAINER=1 OMPUP_FAKE_CP_REPLACE_STAMP="$TMP/backup-replaced"
-  export OMPUP_FAKE_CP_REPLACE_TARGET="$sentinel" OMPUP_FAKE_CP_REPLACE_KIND=backup
+  export OMPUP_FAKE_MV_REPLACE_CONTAINER=1 OMPUP_FAKE_MV_REPLACE_STAMP="$TMP/backup-replaced"
+  export OMPUP_FAKE_MV_REPLACE_TARGET="$sentinel"
   run_ompup pull
   [ "$RC" -ne 0 ] || fail 'replaced local backup container must block'
   assert_eq "$(snapshot "$sentinel")" "$before"
