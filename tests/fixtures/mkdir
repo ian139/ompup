@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+dest=
+for arg in "$@"; do dest=$arg; done
+/bin/mkdir "$@"
+case "${OMPUP_FAKE_MKDIR_RULES_ATTACK:-}:$dest" in
+  transaction:*'/transactions/'[0-9]*-[0-9]*)
+    ln -s "$OMPUP_FAKE_MKDIR_RULES_TARGET" "$dest/rules" ;;
+  baseline:*'/baselines/'[0-9]*)
+    ln -s "$OMPUP_FAKE_MKDIR_RULES_TARGET" "$dest/rules" ;;
+esac

@@ -36,11 +36,13 @@ new_fixture() {
   export OMPUP_FAKE_REMOTE_HOME="$REMOTE" XDG_STATE_HOME="$STATE" OMPUP_FAKE_SSH_LOG="$LOG"
   unset OMPUP_EXCLUDES OMPUP_CMD OMPUP_FAKE_SSH_FAIL OMPUP_FAKE_SSH_FAIL_MATCH
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH OMPUP_FAKE_SSH_MUTATE_PATH
-  unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP
+  unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
   unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
   unset OMPUP_FAKE_SSH_GIT_COMMIT_STAMP OMPUP_FAKE_SSH_GIT_PROJECT
   unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND
   unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET
+  unset OMPUP_FAKE_MKDIR_RULES_ATTACK OMPUP_FAKE_MKDIR_RULES_TARGET
+  unset OMPUP_FAKE_CP_REPLACE_CONTAINER OMPUP_FAKE_CP_REPLACE_STAMP OMPUP_FAKE_CP_REPLACE_TARGET OMPUP_FAKE_CP_REPLACE_KIND
 }
 run_ompup() {
   set +e
@@ -226,14 +228,14 @@ case_dependency_and_transport_failures() {
 
 case_recovery_and_rollback() {
   new_fixture; printf one > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_FAIL_MATCH="mkdir '\\''Projects/.ompup-candidate"
+  export OMPUP_FAKE_SSH_FAIL_MATCH='.ompup-candidate-'
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'pre-journal candidate failure should fail'
   assert_no_file "$(state_file 2>/dev/null || true)"; [ -z "$(marker_file 2>/dev/null || true)" ] || fail 'pre-journal failure published marker'
   unset OMPUP_FAKE_SSH_FAIL_MATCH
 
   new_fixture; printf one > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_FAIL_MATCH="mv '\\''Projects/.ompup-candidate"
-  run_ompup sync; [ "$RC" -ne 0 ] || fail 'post-journal initial swap failure should fail'
+  export OMPUP_FAKE_SSH_FAIL_MATCH='cp -Rp'
+  run_ompup sync; [ "$RC" -ne 0 ] || fail 'post-journal initial promotion failure should fail'
   [ -z "$(marker_file 2>/dev/null || true)" ] || fail 'failed initial rename published marker'
   [ -n "$(find "$STATE" -type f -name journal -print -quit)" ] || fail 'durable initial journal missing'
   unset OMPUP_FAKE_SSH_FAIL_MATCH
@@ -242,8 +244,8 @@ case_recovery_and_rollback() {
   new_fixture; init_non_git
   local rd; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
   printf 'pre\n' > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_FAIL_MATCH='.ompup-backup-'
-  run_ompup sync; [ "$RC" -ne 0 ] || fail 'injected swap failure should fail'; assert_eq "$(cat "$rd/file.txt")" one
+  export OMPUP_FAKE_SSH_FAIL_MATCH='ompup_backup_copy'
+  run_ompup sync; [ "$RC" -ne 0 ] || fail 'injected backup copy failure should fail'; assert_eq "$(cat "$rd/file.txt")" one
   unset OMPUP_FAKE_SSH_FAIL_MATCH
   run_ompup sync; assert_eq "$RC" 0; assert_contains "$OUT" 'recovered uncommitted transaction'; assert_eq "$(cat "$rd/file.txt")" pre
   [ -z "$(find "$STATE" "$REMOTE" -type f -name journal -print)" ] || fail 'journals not cleaned'
@@ -317,7 +319,7 @@ case_quoted_paths_and_command() {
   unset OMPUP_CMD
   badname=$'bad\nname'
   printf bad > "$PROJECT/$badname"
-  run_ompup sync; [ "$RC" -ne 0 ] || fail 'newline pathname should fail'; assert_contains "$OUT" 'unsupported CR/LF/TAB pathname'
+  run_ompup sync; [ "$RC" -ne 0 ] || fail 'newline pathname should fail'; assert_contains "$OUT" 'unsupported control-byte pathname'
   rm "$PROJECT/$badname"
   mkfifo "$PROJECT/pipe"
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'special file should fail closed'; assert_contains "$OUT" 'unsupported special file'
@@ -356,46 +358,48 @@ case_rename_gap_recovery() {
   local rd backup
   rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
   printf 'local handoff\n' > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='.ompup-backup-'
-  run_ompup sync; [ "$RC" -ne 0 ] || fail 'sync rename gap injection should fail'
-  assert_no_file "$rd"
+  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_copy'
+  run_ompup sync; [ "$RC" -ne 0 ] || fail 'sync backup-copy gap injection should fail'
+  assert_eq "$(cat "$rd/file.txt")" one
   backup=$(find "$REMOTE/Projects" -maxdepth 1 -type d -name '.ompup-backup-*' -print -quit)
-  [ -n "$backup" ] || fail 'sync rename-gap backup missing'
+  [ -n "$backup" ] || fail 'sync backup-copy artifact missing'
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
   run_ompup sync; assert_eq "$RC" 0; assert_contains "$OUT" 'recovered uncommitted transaction'
   rd=$(remote_project); assert_eq "$(cat "$rd/file.txt")" 'local handoff'
 
   new_fixture; init_non_git
   rd=$(remote_project); printf 'remote handoff\n' > "$rd/file.txt"
-  export OMPUP_FAKE_MV_FAIL_AFTER_BACKUP=1
-  run_ompup pull; [ "$RC" -ne 0 ] || fail 'pull rename gap injection should fail'
+  export OMPUP_FAKE_CP_FAIL_AFTER_BACKUP=1
+  run_ompup pull; [ "$RC" -ne 0 ] || fail 'pull backup-copy gap injection should fail'
   backup=$(find "$TMP/local" -maxdepth 1 -type d -name '.ompup-backup-*' -print -quit)
-  [ -n "$backup" ] || fail 'pull rename-gap backup missing'
-  unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP
-  run_ompup_from "$backup" pull; assert_eq "$RC" 0
+  [ -n "$backup" ] || fail 'pull backup-copy artifact missing'
+  unset OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
+  run_ompup_from "$backup/tree" pull; assert_eq "$RC" 0
   assert_contains "$OUT" 'recovered uncommitted transaction'; assert_eq "$(cat "$PROJECT/file.txt")" 'remote handoff'
 
   new_fixture; init_git
   rd=$(remote_project); printf 'git remote handoff\n' > "$rd/file.txt"
-  export OMPUP_FAKE_MV_FAIL_AFTER_BACKUP=1
-  run_ompup pull; [ "$RC" -ne 0 ] || fail 'Git pull rename gap injection should fail'
+  export OMPUP_FAKE_CP_FAIL_AFTER_BACKUP=1
+  run_ompup pull; [ "$RC" -ne 0 ] || fail 'Git pull backup-copy gap injection should fail'
   backup=$(find "$TMP/local" -maxdepth 1 -type d -name '.ompup-backup-*' -print -quit)
-  [ -n "$backup" ] || fail 'Git pull rename-gap backup missing'
-  unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP
-  run_ompup_from "$backup" pull; assert_eq "$RC" 0
+  [ -n "$backup" ] || fail 'Git pull backup-copy artifact missing'
+  unset OMPUP_FAKE_CP_FAIL_AFTER_BACKUP
+  run_ompup_from "$backup/tree" pull; assert_eq "$RC" 0
   assert_contains "$OUT" 'recovered uncommitted transaction'; assert_eq "$(cat "$PROJECT/file.txt")" 'git remote handoff'
 }
 
 case_promotion_window_conflicts() {
   new_fixture; init_non_git
-  local rd before_epoch
+  local rd before_epoch backup
   rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
   before_epoch=$(sed -n 's/^epoch	//p' "$(state_file)")
   printf 'desired local\n' > "$PROJECT/file.txt"
   export OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH='/txn/'
   export OMPUP_FAKE_SSH_MUTATE_PATH="$rd/file.txt"
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'remote promotion-window write must block'
-  assert_contains "$OUT" 'changed during promotion'; assert_eq "$(cat "$rd/file.txt")" concurrent
+  assert_contains "$OUT" 'changed during backup copy'
+  backup=$(find "$REMOTE/Projects" -type f -path '*/.ompup-backup-*/tree/file.txt' -print -quit)
+  assert_eq "$(cat "$backup")" concurrent
   assert_eq "$(sed -n 's/^epoch	//p' "$(state_file)")" "$before_epoch"
 
   new_fixture; init_non_git
@@ -403,7 +407,9 @@ case_promotion_window_conflicts() {
   before_epoch=$(sed -n 's/^epoch	//p' "$(state_file)")
   export OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP="$PROJECT/file.txt"
   run_ompup pull; [ "$RC" -ne 0 ] || fail 'local promotion-window write must block'
-  assert_contains "$OUT" 'changed during promotion'; assert_eq "$(cat "$PROJECT/file.txt")" concurrent
+  assert_contains "$OUT" 'changed during backup copy'
+  backup=$(find "$TMP/local" -type f -path '*/.ompup-backup-*/tree/file.txt' -print -quit)
+  assert_eq "$(cat "$backup")" concurrent
   assert_eq "$(sed -n 's/^epoch	//p' "$(state_file)")" "$before_epoch"
 }
 
@@ -420,7 +426,7 @@ case_remote_policy_and_secret_defaults() {
   new_fixture; init_non_git
   rd=$(remote_project); printf 'bad\trule\n' > "$rd/.ompupignore"; printf remote > "$rd/file.txt"
   run_ompup pull; [ "$RC" -ne 0 ] || fail 'TAB in remote policy must block'
-  assert_contains "$OUT" 'contains CR or TAB'; assert_eq "$(cat "$PROJECT/file.txt")" one
+  assert_contains "$OUT" 'unsupported control byte'; assert_eq "$(cat "$PROJECT/file.txt")" one
 
   new_fixture
   mkdir -p "$PROJECT/.docker" "$PROJECT/.kube" "$PROJECT/.config/gh" "$PROJECT/nested/.docker" "$PROJECT/nested/.kube"
@@ -443,7 +449,7 @@ case_malicious_state_and_journals() {
   assert_contains "$OUT" 'invalid state baseline epoch'; assert_eq "$(cat "$victim/value")" safe
 
   new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
-  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='.ompup-backup-'
+  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_copy'
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'journal setup should interrupt'
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
   journal=$(transaction_journal); replace_field "$journal" target_epoch 0003
@@ -451,7 +457,7 @@ case_malicious_state_and_journals() {
   assert_contains "$OUT" 'invalid transaction target epoch'
 
   new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
-  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='.ompup-backup-'
+  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_copy'
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'journal setup should interrupt'
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
   journal=$(transaction_journal); printf 'unexpected\tfield\n' >> "$journal"
@@ -459,7 +465,7 @@ case_malicious_state_and_journals() {
   assert_contains "$OUT" 'unknown transaction journal field'
 
   new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
-  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='.ompup-backup-'
+  printf local > "$PROJECT/file.txt"; export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='ompup_backup_copy'
   run_ompup sync; [ "$RC" -ne 0 ] || fail 'journal setup should interrupt'
   unset OMPUP_FAKE_SSH_FAIL_AFTER_MATCH
   journal=$(transaction_journal); target=$(sed -n 's/^target_epoch	//p' "$journal")
@@ -472,7 +478,7 @@ case_malicious_state_and_journals() {
 case_cleanup_recovery_and_status_blockers() {
   new_fixture
   printf one > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_FAIL_MATCH='.ompup-backup-'
+  export OMPUP_FAKE_SSH_FAIL_MATCH='rm -rf -- tree'
   run_ompup sync; assert_eq "$RC" 0; assert_contains "$OUT" 'committed journal retained'
   journal=$(transaction_journal); assert_file "$journal"
   unset OMPUP_FAKE_SSH_FAIL_MATCH
@@ -502,7 +508,7 @@ case_cleanup_recovery_and_status_blockers() {
 case_initial_sync_third_versions() {
   new_fixture
   printf 'source\n' > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH="mv '\\''Projects/.ompup-candidate"
+  export OMPUP_FAKE_SSH_FAIL_AFTER_MATCH='cp -Rp'
   run_ompup sync
   [ "$RC" -ne 0 ] || fail 'post-rename crash injection should fail'
   local rd journal
@@ -518,7 +524,7 @@ case_initial_sync_third_versions() {
 
   new_fixture
   printf 'source\n' > "$PROJECT/file.txt"
-  export OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH="mv '\\''Projects/.ompup-candidate"
+  export OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH='cp -Rp'
   run_ompup sync
   [ "$RC" -ne 0 ] || fail 'concurrent initial destination must block promotion'
   rd=$(remote_project); assert_eq "$(cat "$rd/concurrent.txt")" concurrent
@@ -611,6 +617,112 @@ case_exclusive_control_creation() {
   assert_eq "$(snapshot "$sentinel")" "$before"
 }
 
+case_rules_publication_races() {
+  local sentinel before
+
+  new_fixture
+  sentinel="$TMP/transaction-rules-sentinel"; printf safe > "$sentinel"; before=$(cat "$sentinel")
+  printf source > "$PROJECT/file"
+  export OMPUP_FAKE_MKDIR_RULES_ATTACK=transaction OMPUP_FAKE_MKDIR_RULES_TARGET="$sentinel"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'precreated transaction rules symlink must block'
+  assert_eq "$(cat "$sentinel")" "$before"
+
+  new_fixture
+  sentinel="$TMP/baseline-rules-sentinel"; printf safe > "$sentinel"; before=$(cat "$sentinel")
+  printf source > "$PROJECT/file"
+  export OMPUP_FAKE_MKDIR_RULES_ATTACK=baseline OMPUP_FAKE_MKDIR_RULES_TARGET="$sentinel"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'precreated baseline rules symlink must block'
+  assert_eq "$(cat "$sentinel")" "$before"
+}
+
+case_container_path_races() {
+  local sentinel before rd
+
+  new_fixture
+  sentinel="$TMP/remote-candidate-container-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  printf source > "$PROJECT/file"
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH='exec rsync'
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND=candidate_container OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET="$sentinel"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'replaced remote candidate container must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
+  sentinel="$TMP/remote-candidate-tree-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  printf local > "$PROJECT/file"
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH='source=$HOME/'
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND=candidate_tree OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET="$sentinel"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'precreated remote candidate tree symlink must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture; init_non_git; rd=$(remote_project); run_ompup pull; assert_eq "$RC" 0
+  sentinel="$TMP/remote-backup-tree-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  printf local > "$PROJECT/file"
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH=ompup_backup_copy
+  export OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND=backup_tree OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET="$sentinel"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'precreated remote backup tree symlink must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture; init_non_git; rd=$(remote_project); printf remote > "$rd/file.txt"
+  sentinel="$TMP/local-candidate-container-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  export OMPUP_FAKE_CP_REPLACE_CONTAINER=1 OMPUP_FAKE_CP_REPLACE_STAMP="$TMP/candidate-replaced"
+  export OMPUP_FAKE_CP_REPLACE_TARGET="$sentinel" OMPUP_FAKE_CP_REPLACE_KIND=candidate
+  run_ompup pull
+  [ "$RC" -ne 0 ] || fail 'replaced local candidate container must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+
+  new_fixture; init_non_git; rd=$(remote_project); printf remote > "$rd/file.txt"
+  sentinel="$TMP/local-backup-container-sentinel"; mkdir "$sentinel"; printf safe > "$sentinel/value"; before=$(snapshot "$sentinel")
+  export OMPUP_FAKE_CP_REPLACE_CONTAINER=1 OMPUP_FAKE_CP_REPLACE_STAMP="$TMP/backup-replaced"
+  export OMPUP_FAKE_CP_REPLACE_TARGET="$sentinel" OMPUP_FAKE_CP_REPLACE_KIND=backup
+  run_ompup pull
+  [ "$RC" -ne 0 ] || fail 'replaced local backup container must block'
+  assert_eq "$(snapshot "$sentinel")" "$before"
+}
+
+case_control_pathnames() {
+  local name rd
+
+  new_fixture
+  name=$'local-\001-control'; printf x > "$PROJECT/$name"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'local C0 pathname must block'
+  assert_contains "$OUT" 'unsupported control-byte pathname'
+  assert_not_contains "$OUT" $'\001'
+
+  new_fixture
+  name=$'local-\177-delete'; printf x > "$PROJECT/$name"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'local DEL pathname must block'
+  assert_not_contains "$OUT" $'\177'
+
+  new_fixture
+  name=$'local-\033]0;owned\007-osc'; printf x > "$PROJECT/$name"
+  run_ompup sync
+  [ "$RC" -ne 0 ] || fail 'local OSC pathname must block'
+  assert_not_contains "$OUT" $'\033'
+  assert_not_contains "$OUT" $'\007'
+
+  new_fixture; init_non_git; rd=$(remote_project)
+  name=$'remote-\033]0;owned\007-osc'; printf x > "$rd/$name"
+  run_ompup status
+  assert_eq "$RC" 0
+  assert_contains "$OUT" 'blocker: remote tree validation failed'
+  assert_not_contains "$OUT" $'\033'
+  assert_not_contains "$OUT" $'\007'
+
+  rm "$rd/$name"
+  name=$'remote-\177-delete'; printf x > "$rd/$name"
+  run_ompup pull
+  [ "$RC" -ne 0 ] || fail 'remote DEL pathname must block pull'
+  assert_contains "$OUT" 'unsupported control-byte pathname'
+  assert_not_contains "$OUT" $'\177'
+}
+
 all_cases=(
   help_version initial_non_git initial_git_and_git_boundary round_trip_and_status
   divergent_git dirty_git_boundaries both_side_conflict identity_isolation
@@ -620,6 +732,7 @@ all_cases=(
   rename_gap_recovery promotion_window_conflicts remote_policy_and_secret_defaults
   malicious_state_and_journals cleanup_recovery_and_status_blockers
   initial_sync_third_versions git_metadata_race exclusive_control_creation
+  rules_publication_races container_path_races control_pathnames
 )
 
 requested=${1:-all}
