@@ -263,6 +263,38 @@ describe("defaultRunner", () => {
     retainArtifact(signalOutcome);
   });
 
+  test("sanitizes control bytes for notifications while preserving raw artifact bytes", async () => {
+    const root = fixtureDirectory();
+    const script = executable(
+      root,
+      "controls",
+      "printf 'out\\033[31mRED\\033]0;title\\007\\000\\177\\302\\201\\n\\t'\nprintf 'err\\033[2J\\000\\177\\302\\201\\n' >&2\nexit 4",
+    );
+    const outcome = await defaultRunner(script, "sync", root, 2_000);
+    const artifact = retainArtifact(outcome);
+    const raw = readFileSync(artifact);
+    expect(raw).toContain(0x1b);
+    expect(raw).toContain(0x00);
+    expect(raw).toContain(0x7f);
+    expect(raw).toContain(0x81);
+    const notification = summarize("sync", outcome).message;
+    expect(notification).toContain("\\x1B[31mRED\\x1B]0;title\\x07\\x00\\x7F\\x81");
+    expect(notification).toContain("\\x1B[2J\\x00\\x7F\\x81");
+    expect(notification).toContain("\n\t");
+    for (const control of ["\x1b", "\x00", "\x7f", "\x81", "\x07"]) expect(notification).not.toContain(control);
+  });
+
+  test("sanitizes spawn and runner error text", async () => {
+    const missing = await defaultRunner(join(fixtureDirectory(), "missing-\x1b[31m"), "status", "/tmp", 2_000);
+    const missingMessage = summarize("status", missing).message;
+    expect(missingMessage).not.toContain("\x1b");
+    expect(missingMessage).toContain("\\x1B");
+    const c = context();
+    await createHandler({ runner: async () => { throw new Error("boom-\x1b]0;bad\x07"); } })("status", c.ctx);
+    expect(c.notifications[0]?.message).toContain("boom-\\x1B]0;bad\\x07");
+    expect(c.notifications[0]?.message).not.toContain("\x1b");
+  });
+
   test("retains private complete artifacts whenever success or failure display is truncated", async () => {
     const root = fixtureDirectory();
     const longSuccess = executable(root, "long-success", "i=0\nwhile [ \"$i\" -lt 2400 ]; do printf x; i=$((i + 1)); done\nprintf '\\nACTIONABLE-SUCCESS\\n'\nprintf 'success-stderr\\n' >&2");

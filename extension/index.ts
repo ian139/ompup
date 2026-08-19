@@ -124,6 +124,52 @@ function boundedAppend(current: string, addition: string): { value: string; trun
     ? { value: combined.slice(-TAIL_LIMIT), truncated: true }
     : { value: combined, truncated: false };
 }
+function sanitizeDisplay(text: string): string {
+  let sanitized = "";
+  for (const character of text) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint === 0x09 || codePoint === 0x0a) {
+      sanitized += character;
+    } else if (codePoint < 0x20 || codePoint === 0x7f || (codePoint >= 0x80 && codePoint <= 0x9f)) {
+      sanitized += `\\x${codePoint.toString(16).padStart(2, "0").toUpperCase()}`;
+    } else {
+      sanitized += character;
+    }
+  }
+  return sanitized;
+}
+
+export function sanitizeNotificationText(text: string): string {
+  return sanitizeDisplay(text);
+}
+
+function sanitizedErrorMessage(error: unknown): string {
+  return sanitizeDisplay(errorMessage(error));
+}
+
+function summarizeDetail(outcome: RunOutcome): string {
+  return sanitizeDisplay(outcome.outputTail.trim());
+}
+
+function summarizeError(outcome: Extract<RunOutcome, { kind: "enoent" | "spawn-error" }>): string {
+  return sanitizedErrorMessage(outcome.error);
+}
+
+export function summarize(verb: Verb, outcome: RunOutcome): { message: string; severity: NotificationSeverity } {
+  const detail = summarizeDetail(outcome);
+  const displayed = detail ? `\n${outcome.outputTruncated ? "…" : ""}${detail}` : "";
+  const artifact = outcome.artifactPath ? `\nFull output: ${outcome.artifactPath}` : "";
+  if (outcome.kind === "exit") {
+    return {
+      severity: outcome.code === 0 ? "info" : "error",
+      message: `ompup ${verb}: ${outcome.code === 0 ? "succeeded" : `exited with code ${outcome.code}`}${displayed}${artifact}`,
+    };
+  }
+  if (outcome.kind === "timeout") return { severity: "error", message: `ompup ${verb}: timed out${displayed}${artifact}` };
+  if (outcome.kind === "signal") return { severity: "error", message: `ompup ${verb}: terminated by ${outcome.signal}${displayed}${artifact}` };
+  if (outcome.kind === "enoent") return { severity: "error", message: `ompup ${verb}: executable not found (${summarizeError(outcome)})${displayed}${artifact}` };
+  return { severity: "error", message: `ompup ${verb}: failed to start (${summarizeError(outcome)})${displayed}${artifact}` };
+}
 
 function capture(spool: OutputSpool, stream: "stdout" | "stderr", chunk: Buffer): void {
   const header = Buffer.from(`\n[${stream} ${chunk.byteLength} bytes]\n`);
@@ -227,21 +273,7 @@ export async function defaultRunner(
   });
 }
 
-export function summarize(verb: Verb, outcome: RunOutcome): { message: string; severity: NotificationSeverity } {
-  const detail = outcome.outputTail.trim();
-  const displayed = detail ? `\n${outcome.outputTruncated ? "…" : ""}${detail}` : "";
-  const artifact = outcome.artifactPath ? `\nFull output: ${outcome.artifactPath}` : "";
-  if (outcome.kind === "exit") {
-    return {
-      severity: outcome.code === 0 ? "info" : "error",
-      message: `ompup ${verb}: ${outcome.code === 0 ? "succeeded" : `exited with code ${outcome.code}`}${displayed}${artifact}`,
-    };
-  }
-  if (outcome.kind === "timeout") return { severity: "error", message: `ompup ${verb}: timed out${displayed}${artifact}` };
-  if (outcome.kind === "signal") return { severity: "error", message: `ompup ${verb}: terminated by ${outcome.signal}${displayed}${artifact}` };
-  if (outcome.kind === "enoent") return { severity: "error", message: `ompup ${verb}: executable not found (${outcome.error.message})${displayed}${artifact}` };
-  return { severity: "error", message: `ompup ${verb}: failed to start (${outcome.error.message})${displayed}${artifact}` };
-}
+ 
 
 function parseVerb(args: string): Verb | undefined {
   const tokens = args.trim() ? args.trim().split(/\s+/) : ["status"];
@@ -274,7 +306,7 @@ export function createHandler(dependencies: HandlerDependencies = {}) {
       const result = summarize(verb, await runner(resolveBinary(), verb, ctx.cwd, timeout));
       ctx.ui.notify(result.message, result.severity);
     } catch (error) {
-      ctx.ui.notify(`ompup ${verb}: runner failed (${errorMessage(error)})`, "error");
+      ctx.ui.notify(`ompup ${verb}: runner failed (${sanitizeDisplay(errorMessage(error))})`, "error");
     } finally {
       ctx.ui.setStatus("ompup", undefined);
       ctx.ui.setWorkingMessage();
