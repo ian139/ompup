@@ -10,6 +10,7 @@ dest_base=${dest##*/}
 if [ "$exact_move" -eq 1 ] && [ "${OMPUP_FAKE_MV_CREATE_DEST_DIR:-0}" = 1 ] && [ ! -e "$OMPUP_FAKE_MV_CREATE_DEST_STAMP" ]; then
   : > "$OMPUP_FAKE_MV_CREATE_DEST_STAMP"
   /bin/mkdir "$dest"
+  printf 'concurrent\n' > "$dest/.ompup-race"
 fi
 if [ "${OMPUP_FAKE_MV_REPLACE_CONTAINER:-0}" = 1 ] && [ ! -e "$OMPUP_FAKE_MV_REPLACE_STAMP" ]; then
   cwd=$(pwd -P)
