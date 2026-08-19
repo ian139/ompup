@@ -1494,7 +1494,11 @@ def main() -> None:
         if args.command == "auth":
             run_auth_command(args)
             return
-        root = resolve_project(getattr(args, "project", "") or "", getattr(args, "pick", False))
+        root = resolve_project(
+            getattr(args, "project", "") or "",
+            getattr(args, "pick", False),
+            init_missing=args.command in {"up", "shell", "sync", "handoff"},
+        )
         project = root.name
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", project):
             die(f"project name {project!r} is not safe for remote paths")

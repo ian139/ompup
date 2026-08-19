@@ -199,6 +199,8 @@ ompup env status --all
 ## Notes
 
 - Project names resolve from the current Git repository, an explicit path, or a case-insensitive directory under `OMPUP_PROJECTS_ROOT`.
+- A directory that is not yet a Git repository is initialized automatically by `ompup`, `ompup sync`, `ompup shell`, and handoff. Home, `OMPUP_PROJECTS_ROOT`, and common personal directories are refused; create a project directory first.
+- `/ompup` subcommands accept any unique prefix, such as `/ompup st` for status.
 - The repository directory name also becomes the tmux session name.
 - In sessions created by `ompup up`, quitting omp drops to a remote shell instead of killing tmux.
 - Fast-forward commits and dirty working trees use negotiated Git object transfer. Divergent history requires normal Git reconciliation.

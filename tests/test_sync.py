@@ -104,6 +104,19 @@ class GitTransportIntegrationTests(unittest.TestCase):
         refs = CLI.git(repository, "for-each-ref", "--format=%(refname)", "refs/ompup")
         self.assertEqual(refs, "")
 
+    def test_bootstrap_transfers_a_repository_with_no_commits(self) -> None:
+        fresh = Path(self.temporary.name) / "fresh"
+        CLI.run(["git", "init", "-q", "-b", "main", str(fresh)])
+        (fresh / "notes.txt").write_text("uncommitted\n")
+
+        with self._local_transport():
+            CLI.sync_up(fresh, "project", self.state_key, self.remote_dir, self.identity, "")
+
+        self.assertEqual((self.remote / "notes.txt").read_text(), "uncommitted\n")
+        with self._local_transport():
+            self.assertEqual(CLI.remote_state(self.remote_dir), CLI.local_state(fresh))
+        self._assert_no_transport_refs(fresh)
+
     def test_ssh_transport_uses_private_process_scoped_socket(self) -> None:
         with patch.object(CLI.Path, "home", return_value=self.home):
             CLI.configure_ssh_transport("compute-box")

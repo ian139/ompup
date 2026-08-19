@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from ompup.hosts import (  # noqa: E402
     pin_host,
     probe_hosts,
     remote_project_dir,
+    resolve_project,
 )
 
 
@@ -48,6 +50,66 @@ def probe(
         session_exists=session,
         tools_ok=True,
     )
+
+
+class ProjectResolutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name).resolve()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_initializes_missing_repository_for_explicit_directory(self) -> None:
+        project = self.base / "fresh-project"
+        project.mkdir()
+        (project / "notes.txt").write_text("hello\n")
+
+        root = resolve_project(str(project), init_missing=True)
+
+        self.assertEqual(root, project)
+        self.assertTrue((project / ".git").is_dir())
+
+    def test_initializes_missing_repository_for_current_directory(self) -> None:
+        project = self.base / "cwd-project"
+        project.mkdir()
+        original = Path.cwd()
+        os.chdir(project)
+        try:
+            root = resolve_project(init_missing=True)
+        finally:
+            os.chdir(original)
+
+        self.assertEqual(root, project)
+        self.assertTrue((project / ".git").is_dir())
+
+    def test_refuses_to_initialize_protected_directories(self) -> None:
+        fake_home = self.base / "home"
+        (fake_home / "Downloads").mkdir(parents=True)
+        with mock.patch.object(hosts_module.Path, "home", return_value=fake_home):
+            for target in (fake_home, fake_home / "Downloads"):
+                with self.assertRaisesRegex(HostSelectionError, "refusing to initialize"):
+                    resolve_project(str(target), init_missing=True)
+                self.assertFalse((target / ".git").exists())
+
+    def test_non_repository_without_init_reports_actionable_error(self) -> None:
+        plain = self.base / "plain"
+        plain.mkdir()
+        projects_root = self.base / "projects"
+        candidate = projects_root / "candidate"
+        candidate.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(candidate)], check=True)
+        original = Path.cwd()
+        os.chdir(plain)
+        try:
+            with (
+                mock.patch.dict(os.environ, {"OMPUP_PROJECTS_ROOT": str(projects_root)}),
+                mock.patch.object(hosts_module, "sys_stdin_is_tty", return_value=False),
+                self.assertRaisesRegex(HostSelectionError, "not inside a Git repository"),
+            ):
+                resolve_project()
+        finally:
+            os.chdir(original)
 
 
 class HostSelectionTests(unittest.TestCase):

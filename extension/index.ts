@@ -18,7 +18,12 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const SUBCOMMANDS: Record<string, true> = { sync: true, pull: true, status: true, handoff: true };
+const SUBCOMMANDS = ["sync", "pull", "status", "handoff"] as const;
+
+function resolveSubcommand(token: string): string | null {
+ const matches = SUBCOMMANDS.filter((name) => name.startsWith(token));
+ return matches.length === 1 ? matches[0] : null;
+}
 
 function cliPath(): string {
  // Prefer the CLI bundled beside this module (plugin/link installs keep
@@ -64,9 +69,9 @@ export default function ompup(pi: ExtensionAPI) {
   description: "Sync project state or hand this live session to remote tmux",
   handler: async (args, ctx) => {
    const tokens = args.trim() ? args.trim().split(/\s+/) : ["status"];
-   const sub = tokens.shift()!;
-   if (!SUBCOMMANDS[sub]) {
-    ctx.ui.notify(`/ompup takes one of: ${Object.keys(SUBCOMMANDS).join(", ")}`, "error");
+   const sub = resolveSubcommand(tokens.shift()!);
+   if (!sub) {
+    ctx.ui.notify(`/ompup takes one of: ${SUBCOMMANDS.join(", ")} (a unique prefix works)`, "error");
     return;
    }
 

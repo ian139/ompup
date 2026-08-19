@@ -476,9 +476,12 @@ def project_candidates(projects_root: Path | None = None) -> list[Path]:
     )
 
 
-def resolve_project(value: str = "", pick: bool = False) -> Path:
+def resolve_project(value: str = "", pick: bool = False, init_missing: bool = False) -> Path:
     if value:
         supplied = Path(value).expanduser()
+        if supplied.is_dir() and init_missing:
+            root = _git_root(supplied, required=False)
+            return root if root is not None else _initialize_repository(supplied)
         if supplied.exists():
             return _git_root(supplied)
         candidates = [path for path in project_candidates() if path.name.lower() == value.lower()]
@@ -489,11 +492,15 @@ def resolve_project(value: str = "", pick: bool = False) -> Path:
     cwd_root = _git_root(Path.cwd(), required=False)
     if cwd_root is not None and not pick:
         return cwd_root
+    if init_missing and not pick:
+        return _initialize_repository(Path.cwd())
     candidates = project_candidates()
     if not candidates:
         raise HostSelectionError("no Git projects found under the configured projects root")
     if not sys_stdin_is_tty():
-        raise HostSelectionError("choose a project explicitly when no interactive terminal is available")
+        raise HostSelectionError(
+            "not inside a Git repository; run ompup from the project, pass its name, or pick interactively from a terminal"
+        )
     names = "\n".join(path.name for path in candidates) + "\n"
     if shutil.which("fzf"):
         result = subprocess.run(
@@ -511,6 +518,27 @@ def resolve_project(value: str = "", pick: bool = False) -> Path:
     if not choice.isdigit() or not 1 <= int(choice) <= len(candidates):
         raise HostSelectionError("invalid project selection")
     return _git_root(candidates[int(choice) - 1])
+
+
+def _initialize_repository(path: Path) -> Path:
+    path = path.resolve()
+    home = Path.home().resolve()
+    projects_root = (
+        Path(os.environ.get("OMPUP_PROJECTS_ROOT", home / "Projects")).expanduser().resolve()
+    )
+    protected = {Path(path.anchor), home, projects_root}
+    protected.update(home / name for name in ("Desktop", "Documents", "Downloads", "Library"))
+    if path in protected or ".git" in path.parts:
+        raise HostSelectionError(
+            f"refusing to initialize a Git repository in {path}; create a project directory and run ompup inside it"
+        )
+    result = subprocess.run(["git", "init", "-q", str(path)], text=True, capture_output=True)
+    if result.returncode != 0:
+        raise HostSelectionError(
+            f"could not initialize a Git repository in {path}: {result.stderr.strip()}"
+        )
+    print(f"ompup: initialized a Git repository in {path}")
+    return path
 
 
 def _git_root(path: Path, required: bool = True) -> Path | None:
