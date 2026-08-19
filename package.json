@@ -7,6 +7,10 @@
     "type": "git",
     "url": "https://github.com/wolfiesch/ompup.git"
   },
+  "homepage": "https://github.com/wolfiesch/ompup",
+  "bugs": {
+    "url": "https://github.com/wolfiesch/ompup/issues"
+  },
   "bin": {
     "ompup": "./bin/ompup"
   },

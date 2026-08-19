@@ -74,7 +74,7 @@ PRESERVED_DIRS = {
     ".turbo",
     ".cache",
 }
-SENSITIVE_NAMES = {".env", ".envrc", ".npmrc", ".pypirc"}
+SENSITIVE_NAMES = {".env", ".envrc", ".netrc", ".npmrc", ".pypirc"}
 
 REMOTE_STATE_SCRIPT = r"""
 set -euo pipefail
