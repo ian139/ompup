@@ -523,11 +523,13 @@ def resolve_project(value: str = "", pick: bool = False, init_missing: bool = Fa
 def _initialize_repository(path: Path) -> Path:
     path = path.resolve()
     home = Path.home().resolve()
-    projects_root = (
+    configured_root = (
         Path(os.environ.get("OMPUP_PROJECTS_ROOT", home / "Projects")).expanduser().resolve()
     )
-    protected = {Path(path.anchor), home, projects_root}
-    protected.update(home / name for name in ("Desktop", "Documents", "Downloads", "Library"))
+    protected = {Path(path.anchor), home, configured_root, (home / "Projects").resolve()}
+    protected.update(
+        (home / name).resolve() for name in ("Desktop", "Documents", "Downloads", "Library")
+    )
     if path in protected or ".git" in path.parts:
         raise HostSelectionError(
             f"refusing to initialize a Git repository in {path}; create a project directory and run ompup inside it"

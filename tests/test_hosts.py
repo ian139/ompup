@@ -92,6 +92,21 @@ class ProjectResolutionTests(unittest.TestCase):
                     resolve_project(str(target), init_missing=True)
                 self.assertFalse((target / ".git").exists())
 
+    def test_default_projects_directory_stays_protected_with_custom_root(self) -> None:
+        fake_home = self.base / "home"
+        default_projects = fake_home / "Projects"
+        default_projects.mkdir(parents=True)
+        custom_root = self.base / "elsewhere"
+        custom_root.mkdir()
+        with (
+            mock.patch.object(hosts_module.Path, "home", return_value=fake_home),
+            mock.patch.dict(os.environ, {"OMPUP_PROJECTS_ROOT": str(custom_root)}),
+        ):
+            for target in (default_projects, custom_root):
+                with self.assertRaisesRegex(HostSelectionError, "refusing to initialize"):
+                    resolve_project(str(target), init_missing=True)
+                self.assertFalse((target / ".git").exists())
+
     def test_non_repository_without_init_reports_actionable_error(self) -> None:
         plain = self.base / "plain"
         plain.mkdir()
