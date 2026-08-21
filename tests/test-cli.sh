@@ -334,12 +334,12 @@ case_attach_and_default_safety() {
   new_fixture; init_non_git
   : > "$LOG"
   run_ompup; [ "$RC" -ne 0 ] || fail 'default should not skip remote-owned sync'; assert_contains "$OUT" 'run ompup attach'
-  assert_not_contains "$(cat "$LOG")" 'tmux new-session'
-  run_ompup attach; assert_eq "$RC" 0; assert_contains "$(cat "$LOG")" 'tmux new-session'
+  assert_not_contains "$(cat "$LOG")" 'tmux -u new-session'
+  run_ompup attach; assert_eq "$RC" 0; assert_contains "$(cat "$LOG")" 'tmux -u new-session'
   local rd; rd=$(remote_project); printf remote > "$rd/remote-edit"
-  : > "$LOG"; run_ompup; [ "$RC" -ne 0 ] || fail 'default must not attach after ownership conflict'; assert_not_contains "$(cat "$LOG")" 'tmux new-session'
+  : > "$LOG"; run_ompup; [ "$RC" -ne 0 ] || fail 'default must not attach after ownership conflict'; assert_not_contains "$(cat "$LOG")" 'tmux -u new-session'
   new_fixture; printf one > "$PROJECT/file.txt"; run_ompup
-  assert_eq "$RC" 0; assert_contains "$(cat "$LOG")" 'tmux new-session'
+  assert_eq "$RC" 0; assert_contains "$(cat "$LOG")" 'tmux -u new-session'
 }
 
 case_explicit_ownership_boundaries() {

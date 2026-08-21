@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 state=${OMPUP_FAKE_REMOTE_HOME:?}/.tmux-sessions
+while [ "${1:-}" = "-u" ]; do shift; done
 cmd=${1:-}; shift || true
 case "$cmd" in
   has-session)
