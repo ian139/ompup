@@ -1688,7 +1688,7 @@ attach_cmd() {
   if [ "$1" = shell ]; then command_text='exec "${SHELL:-/bin/sh}"'
   else command_text="$LAUNCH; exec \"\${SHELL:-/bin/sh}\""; fi
   tmux_command="bash -lc $(sq "$command_text")"
-  exec ssh -t "$HOST" "tmux new-session -A -s $(sq "$SESSION") -c \"\$HOME/$REMOTE_DIR\" $(sq "$tmux_command")"
+  exec ssh -t "$HOST" "LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 tmux -u new-session -A -s $(sq "$SESSION") -c \"\$HOME/$REMOTE_DIR\" $(sq "$tmux_command")"
 }
 
 case "$CMD" in
