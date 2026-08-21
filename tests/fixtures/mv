@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+dest=
+exact_move=0
+for arg in "$@"; do
+  dest=$arg
+  case "$arg" in -h|-T) exact_move=1 ;; esac
+done
+if [ "$dest" = --help ] && [ "${OMPUP_FAKE_MV_LEGACY_MODE:-0}" = 1 ]; then
+  exit 1
+fi
+run_mv() {
+  if [ "${1:-}" = -h ]; then shift; fi
+  /bin/mv "$@"
+}
+dest_base=${dest##*/}
+if [ "$exact_move" -eq 1 ] && [ "${OMPUP_FAKE_MV_CREATE_DEST_DIR:-0}" = 1 ] && [ ! -e "$OMPUP_FAKE_MV_CREATE_DEST_STAMP" ]; then
+  : > "$OMPUP_FAKE_MV_CREATE_DEST_STAMP"
+  /bin/mkdir "$dest"
+  printf 'concurrent\n' > "$dest/.ompup-race"
+fi
+if [ "$exact_move" -eq 1 ] && [ -n "${OMPUP_FAKE_MV_CREATE_MATCH:-}" ] && [ ! -e "$OMPUP_FAKE_MV_CREATE_MATCH_STAMP" ]; then
+  case "$dest" in
+    *"$OMPUP_FAKE_MV_CREATE_MATCH"*)
+      : > "$OMPUP_FAKE_MV_CREATE_MATCH_STAMP"
+      /bin/mkdir "$dest"
+      printf 'concurrent rollback\n' > "$dest/.ompup-race" ;;
+  esac
+fi
+if [ "${OMPUP_FAKE_MV_REPLACE_CONTAINER:-0}" = 1 ] && [ ! -e "$OMPUP_FAKE_MV_REPLACE_STAMP" ]; then
+  cwd=$(pwd -P)
+  case "$cwd" in
+    */.ompup-backup-*)
+      : > "$OMPUP_FAKE_MV_REPLACE_STAMP"
+      /bin/mv "$cwd" "$cwd.displaced"
+      ln -s "$OMPUP_FAKE_MV_REPLACE_TARGET" "$cwd" ;;
+  esac
+fi
+recovery_mutate=${OMPUP_FAKE_RECOVERY_MV_MUTATE_PATH:-}
+mutate_path=${OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP:-${OMPUP_FAKE_REMOTE_MV_MUTATE_BEFORE_BACKUP:-}}
+should_inject=0
+if [ "$dest_base" = tree ] && { [ -n "$mutate_path" ] || [ "${OMPUP_FAKE_MV_FAIL_AFTER_BACKUP:-0}" = 1 ]; }; then
+  should_inject=1
+fi
+case "$dest_base:$recovery_mutate" in tree:?*|failed:?*) mutate_path=$recovery_mutate; should_inject=1 ;; esac
+if [ "$should_inject" -eq 1 ]; then
+  if [ -n "$mutate_path" ]; then
+    printf 'concurrent\n' > "$mutate_path"
+  fi
+  run_mv "$@"
+  [ "${OMPUP_FAKE_MV_FAIL_AFTER_BACKUP:-0}" != 1 ] || exit 99
+  exit 0
+fi
+run_mv "$@"

@@ -1,1575 +1,1713 @@
-#!/usr/bin/env python3
-"""Safely enter a project-specific OMP session on a remote development box.
+#!/usr/bin/env bash
+# ompup v0.2 - explicit, crash-recoverable project handoff over SSH.
+#
+# Configuration: OMPUP_HOST, OMPUP_REMOTE_ROOT (default Projects),
+# OMPUP_CMD (default omp; shell text), OMPUP_EXCLUDES, XDG_STATE_HOME.
+# OMPUP_CMD is intentionally evaluated by `bash -lc` on the remote. It must
+# not contain CR, LF, or TAB. Ompup otherwise treats configuration as data.
+set -euo pipefail
 
-Committed history and uncommitted working snapshots travel through negotiated
-Git object transport. Every transfer is guarded by the exact HEAD and tree
-recorded after the last successful synchronization.
-"""
+VERSION=0.2.0
+PROGRAM=${0##*/}
+LC_ALL=C
+export LC_ALL
 
-from __future__ import annotations
+say() { printf '%s\n' "$*"; }
+warn() { printf 'ompup: %s\n' "$*" >&2; }
+die() { warn "$*"; exit 1; }
 
-import argparse
+usage() {
+  cat <<'EOF'
+Usage: ompup [sync|pull|attach|shell|status] [--dry-run] [--acknowledge-excluded]
+       ompup help | --help
+       ompup version | --version
 
-import hashlib
-import json
-import os
-from pathlib import Path
-import re
-import shlex
-import shutil
-import subprocess
-import sys
-import tempfile
-from urllib.parse import parse_qsl, urlsplit
+An explicit two-copy handoff. `sync` hands ownership to the remote; `pull`
+hands ownership to local; `attach` never transfers data. With no command,
+ompup syncs and attaches only after a successful handoff. When the remote
+already owns the tree, run `ompup attach`.
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from ompup.environment import (  # noqa: E402
-    CONFIG_ROOT,
-    bootstrap_auth,
-    build_release,
-    cleanup_release,
-    ensure_environment,
-    environment_status,
-    format_environment_status,
-    load_environment_config,
-    preserved_environment_status,
-    select_hosts,
-    sync_environment,
-)
+Options:
+  --dry-run                 inspect sync/pull without managed mutations
+  --acknowledge-excluded    acknowledge the exact tracked files omitted
 
-from ompup.hosts import (  # noqa: E402
-    HostChoice,
-    HostProbe,
-    HostSelectionError,
-    choose_host,
-    find_host,
-    format_probe,
-    load_hosts,
-    pin_host,
-    pinned_host,
-    probe_hosts,
-    project_profile,
-    resolve_project,
-    unpin_host,
-)
+Environment:
+  OMPUP_HOST                narrow SSH alias or user@host (required)
+  OMPUP_REMOTE_ROOT         relative remote root (default: Projects)
+  OMPUP_CMD                 remote bash text launched by attach (default: omp)
+  OMPUP_EXCLUDES            colon-separated extra rsync exclude patterns
+  XDG_STATE_HOME            local state base override
 
-VERSION = "0.6.0"
-LEGACY_HOST = os.environ.get("OMPUP_HOST", "")
-REMOTE_ROOT = os.environ.get("OMPUP_REMOTE_ROOT", "Projects").strip("/")
-LAUNCH_OVERRIDE = os.environ.get("OMPUP_CMD", "")
-LAUNCH = ""
-REMOTE = ""
-SSH_CONTROL_PATH = ""
-PRESERVED_DIRS = {
-    "node_modules",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".turbo",
-    ".cache",
+The exclusion policy is a convenience denylist, not a secret scanner.
+EOF
 }
-SENSITIVE_NAMES = {".env", ".envrc", ".netrc", ".npmrc", ".pypirc"}
 
-REMOTE_STATE_SCRIPT = r"""
-set -euo pipefail
-repo="$HOME/$1"
-git_dir=$(git -C "$repo" rev-parse --absolute-git-dir)
-idx=$(mktemp)
-rm -f "$idx"
-trap 'rm -f "$idx"' EXIT
-if [ -f "$git_dir/index" ]; then cp "$git_dir/index" "$idx"; fi
-GIT_INDEX_FILE="$idx" git -C "$repo" add -A -- . >/dev/null
-head=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')
-tree=$(GIT_INDEX_FILE="$idx" git -C "$repo" write-tree)
-printf '%s:%s\n' "$head" "$tree"
-"""
-
-READ_BASELINE_SCRIPT = r"""
-set -euo pipefail
-path="$HOME/.local/state/ompup/$1.state"
-[ -f "$path" ] || exit 3
-cat "$path"
-"""
-
-WRITE_BASELINE_SCRIPT = r"""
-set -euo pipefail
-umask 077
-dir="$HOME/.local/state/ompup"
-mkdir -p "$dir"
-tmp=$(mktemp "$dir/.state.XXXXXX")
-trap 'rm -f "$tmp"' EXIT
-printf '%s\n%s\n' "$2" "$3" > "$tmp"
-mv "$tmp" "$dir/$1.state"
-trap - EXIT
-"""
-
-BOOTSTRAP_SCRIPT = r"""
-set -euo pipefail
-target="$HOME/$1"
-branch="$2"
-origin="$3"
-[ ! -e "$target" ] || { echo 'remote project path already exists' >&2; exit 4; }
-mkdir -p "$(dirname "$target")"
-cleanup() { rm -rf "$target"; }
-trap cleanup ERR INT TERM
-git init -q -b "$branch" "$target"
-if [ -n "$origin" ]; then git -C "$target" remote add origin "$origin"; fi
-trap - ERR INT TERM
-"""
-
-REMOVE_REMOTE_PROJECT_SCRIPT = r"""
-set -euo pipefail
-target="$HOME/$1"
-[ -d "$target/.git" ] || { echo 'refusing to remove a non-repository path' >&2; exit 4; }
-rm -rf "$target"
-"""
-
-APPLY_COMMIT_SCRIPT = r"""
-set -euo pipefail
-repo="$HOME/$1"
-incoming_ref="$2"
-branch="$3"
-expected_old="$4"
-expected_new="$5"
-current_branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD)
-if [ "$current_branch" != "$branch" ]; then
-  printf 'branch mismatch: remote=%s local=%s\n' "$current_branch" "$branch" >&2
-  exit 6
-fi
-current=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')
-if [ "$current" != "$expected_old" ]; then
-  printf 'remote HEAD changed during transfer: expected=%s actual=%s\n' "$expected_old" "$current" >&2
-  exit 7
-fi
-incoming=$(git -C "$repo" rev-parse --verify "$incoming_ref^{commit}")
-if [ "$incoming" != "$expected_new" ]; then
-  printf 'incoming commit mismatch: expected=%s actual=%s\n' "$expected_new" "$incoming" >&2
-  exit 8
-fi
-if [ "$current" != '0000000000000000000000000000000000000000' ]; then
-  git -C "$repo" merge-base --is-ancestor "$current" "$incoming"
-fi
-git -C "$repo" reset --hard -q "$incoming"
-git -C "$repo" update-ref -d "$incoming_ref"
-"""
-
-APPLY_SNAPSHOT_SCRIPT = r"""
-set -euo pipefail
-repo="$HOME/$1"
-incoming_ref="$2"
-expected_tree="$3"
-expected_head="$4"
-current=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')
-if [ "$current" != "$expected_head" ]; then
-  printf 'remote HEAD changed before snapshot apply: expected=%s actual=%s\n' "$expected_head" "$current" >&2
-  exit 7
-fi
-incoming=$(git -C "$repo" rev-parse --verify "$incoming_ref^{tree}")
-if [ "$incoming" != "$expected_tree" ]; then
-  printf 'incoming snapshot mismatch: expected=%s actual=%s\n' "$expected_tree" "$incoming" >&2
-  exit 8
-fi
-git -C "$repo" read-tree --dry-run --reset -u "$incoming_ref"
-git -C "$repo" read-tree --reset -u "$incoming_ref"
-git -C "$repo" update-ref -d "$incoming_ref"
-"""
-
-CREATE_SNAPSHOT_REF_SCRIPT = r"""
-set -euo pipefail
-repo="$HOME/$1"
-expected_head="$2"
-expected_tree="$3"
-snapshot_ref="$4"
-current=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')
-if [ "$current" != "$expected_head" ]; then
-  printf 'remote HEAD changed during export: expected=%s actual=%s\n' "$expected_head" "$current" >&2
-  exit 7
-fi
-git_dir=$(git -C "$repo" rev-parse --absolute-git-dir)
-idx=$(mktemp)
-rm -f "$idx"
-trap 'rm -f "$idx"' EXIT
-if [ -f "$git_dir/index" ]; then cp "$git_dir/index" "$idx"; fi
-GIT_INDEX_FILE="$idx" git -C "$repo" add -A -- . >/dev/null
-actual=$(GIT_INDEX_FILE="$idx" git -C "$repo" write-tree)
-if [ "$actual" != "$expected_tree" ]; then
-  printf 'remote snapshot changed during export: expected=%s actual=%s\n' "$expected_tree" "$actual" >&2
-  exit 7
-fi
-git -C "$repo" update-ref "$snapshot_ref" "$actual"
-"""
-
-DELETE_REF_SCRIPT = r"""
-set -euo pipefail
-git -C "$HOME/$1" update-ref -d "$2"
-"""
-
-PREPARE_HANDOFF_SCRIPT = r"""
-set -euo pipefail
-target="$HOME/$1"
-umask 077
-rm -rf "$target"
-mkdir -p "$target"
-chmod 700 "$target"
-"""
-
-VERIFY_HANDOFF_SCRIPT = r"""
-set -euo pipefail
-target="$HOME/$1"
-expected="$2"
-launch="$3"
-session_file="$target/session.jsonl"
-case "$launch" in
-  '$HOME/'*) launch="$HOME/${launch#\$HOME/}" ;;
-  '~/'*) launch="$HOME/${launch#\~/}" ;;
+# Help/version deliberately precede configuration, discovery and dependencies.
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+  version|--version) printf 'ompup %s\n' "$VERSION"; exit 0 ;;
 esac
-actual=$(python3 - "$session_file" <<'PY'
-import hashlib
-import pathlib
-import sys
 
-path = pathlib.Path(sys.argv[1])
-digest = hashlib.sha256()
-with path.open("rb") as handle:
-    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-        digest.update(chunk)
-print(digest.hexdigest())
-PY
-)
-[ "$actual" = "$expected" ] || {
-  printf 'session checksum mismatch: expected=%s actual=%s\n' "$expected" "$actual" >&2
-  exit 5
+CMD=up
+DRY_RUN=0
+ACKNOWLEDGE=0
+SEEN_CMD=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    sync|pull|attach|shell|status)
+      [ "$SEEN_CMD" -eq 0 ] || die "only one command may be specified"
+      CMD=$1; SEEN_CMD=1 ;;
+    --dry-run)
+      [ "$DRY_RUN" -eq 0 ] || die "duplicate --dry-run"
+      DRY_RUN=1 ;;
+    --acknowledge-excluded)
+      [ "$ACKNOWLEDGE" -eq 0 ] || die "duplicate --acknowledge-excluded"
+      ACKNOWLEDGE=1 ;;
+    *) die "unknown argument '$1'" ;;
+  esac
+  shift
+done
+[ "$DRY_RUN" -eq 0 ] || { [ "$CMD" = sync ] || [ "$CMD" = pull ] || die "--dry-run applies only to sync or pull"; }
+[ "$ACKNOWLEDGE" -eq 0 ] || { [ "$CMD" = sync ] || [ "$CMD" = pull ] || die "--acknowledge-excluded applies only to sync or pull"; }
+
+contains_control() {
+  [[ "$1" =~ [[:cntrl:]] ]]
 }
-chmod 600 "$session_file"
-[ ! -d "$target/session" ] || chmod -R go-rwx "$target/session"
-validation_dir=$(mktemp -d "$target/.validate.XXXXXX")
-trap 'rm -rf "$validation_dir"' EXIT
-(
-  cd "$validation_dir"
-  "$launch" --export "$session_file" >/dev/null
-)
-"""
+require_plain() {
+  if contains_control "$2"; then die "$1 contains an unsupported control byte"; fi
+  return 0
+}
+escape_path() { printf '%q' "$1"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required local command not found: $1"; }
 
-START_HANDOFF_SCRIPT = r"""
-set -euo pipefail
-repo="$HOME/$1"
-session="$2"
-session_file="$HOME/$3"
-launch="$4"
-fingerprint="$5"
-case "$launch" in
-  '$HOME/'*) launch="$HOME/${launch#\$HOME/}" ;;
-  '~/'*) launch="$HOME/${launch#\~/}" ;;
+HOST=${OMPUP_HOST:-}
+REMOTE_ROOT=${OMPUP_REMOTE_ROOT:-Projects}
+LAUNCH=${OMPUP_CMD:-omp}
+[ -n "$HOST" ] || die "set OMPUP_HOST to an SSH alias or user@host"
+require_plain OMPUP_HOST "$HOST"
+case "$HOST" in
+  -*|*:*|*[!A-Za-z0-9_.@-]*) die "OMPUP_HOST must be a single SSH alias or user@host token" ;;
 esac
-tmux has-session -t "=$session" 2>/dev/null && {
-  printf 'tmux session already exists: %s\n' "$session" >&2
-  exit 4
-}
-printf -v command '%q ' "$launch" --cwd "$repo" --resume "$session_file"
-tmux new-session -d -s "$session" -c "$repo" "$command"
-if [ -n "$fingerprint" ]; then
-  tmux set-option -t "$session" @ompup-environment "$fingerprint"
-fi
-tmux has-session -t "=$session" 2>/dev/null || {
-  printf 'remote OMP exited before becoming attachable\n' >&2
-  exit 6
-}
-"""
+[ -n "$REMOTE_ROOT" ] || die "OMPUP_REMOTE_ROOT must not be empty"
+require_plain OMPUP_REMOTE_ROOT "$REMOTE_ROOT"
+case "$REMOTE_ROOT" in
+  /*|*/|*//*|*[^A-Za-z0-9._/-]*) die "OMPUP_REMOTE_ROOT must contain only safe relative path segments" ;;
+esac
+oldifs=$IFS; IFS=/; set -- $REMOTE_ROOT; IFS=$oldifs
+for segment in "$@"; do
+  [ -n "$segment" ] && [ "$segment" != . ] && [ "$segment" != .. ] || die "OMPUP_REMOTE_ROOT contains an invalid segment"
+done
+[ -n "$LAUNCH" ] || die "OMPUP_CMD must not be empty"
+require_plain OMPUP_CMD "$LAUNCH"
+require_plain OMPUP_EXCLUDES "${OMPUP_EXCLUDES:-}"
 
-CLEANUP_HANDOFF_SCRIPT = r"""
+need git
+need ssh
+need rsync
+need mv
+MV_NO_TARGET_FLAG=-h
+if mv --help 2>&1 | grep -q -- '--no-target-directory'; then MV_NO_TARGET_FLAG=-T; fi
+absolute_slot() {
+  local path=$1 parent name physical
+  case "$path" in
+    */*) parent=${path%/*}; name=${path##*/}; [ -n "$parent" ] || parent=/ ;;
+    *) parent=.; name=$path ;;
+  esac
+  physical=$(cd "$parent" && pwd -P) || return 1
+  if [ "$physical" = / ]; then printf '/%s' "$name"; else printf '%s/%s' "$physical" "$name"; fi
+}
+move_platform() { mv "$MV_NO_TARGET_FLAG" "$1" "$2"; }
+tracked_move() (
+  local source=$1 destination=$2 tracker tracker_pid= moved=0 actual
+  tracker=$(mktemp -d "${TMPDIR:-/tmp}/ompup-move.XXXXXX") || return 1
+  trap '[ -z "$tracker_pid" ] || kill "$tracker_pid" 2>/dev/null || true; rm -rf "$tracker"' EXIT HUP INT TERM
+  (
+    cd "$source" || exit 1
+    : > "$tracker/ready"
+    while [ ! -e "$tracker/go" ]; do :; done
+    pwd -P > "$tracker/actual"
+  ) &
+  tracker_pid=$!
+  while [ ! -e "$tracker/ready" ]; do
+    kill -0 "$tracker_pid" 2>/dev/null || { wait "$tracker_pid" || true; return 1; }
+  done
+  if move_platform "$source" "$destination"; then moved=1; fi
+  : > "$tracker/go"
+  wait "$tracker_pid" || return 1
+  tracker_pid=
+  IFS= read -r actual < "$tracker/actual" || return 1
+  [ "$moved" -eq 1 ] || return 1
+  printf '%s' "$actual"
+)
+move_exact() {
+  local source destination actual rollback_actual
+  source=$(absolute_slot "$1") || return 1
+  destination=$(absolute_slot "$2") || return 1
+  actual=$(tracked_move "$source" "$destination") || return 1
+  [ "$actual" = "$destination" ] && return 0
+  if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+    if ! rollback_actual=$(tracked_move "$actual" "$source"); then
+      printf 'ompup: exact-move rollback failed; source may remain at %s\n' "$actual" >&2
+      return 1
+    fi
+    if [ "$rollback_actual" != "$source" ]; then
+      printf 'ompup: exact-move rollback target changed; source preserved at %s\n' "$rollback_actual" >&2
+      return 1
+    fi
+  fi
+  return 1
+}
+STATE_ANCHOR=${XDG_STATE_HOME:-$HOME/.local/state}
+STATE_BASE="$STATE_ANCHOR/ompup"
+
+valid_epoch() {
+  local value=$1
+  case "$value" in ''|0|0*|*[!0-9]*) return 1 ;; esac
+  [ "${#value}" -lt 10 ] || { [ "${#value}" -eq 10 ] && [[ "$value" < 2147483648 ]]; }
+}
+
+valid_sha1() {
+  [ "${#1}" -eq 40 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; *) return 0 ;; esac
+}
+# A pull can leave the live root absent after renaming it into its exclusively
+# created backup container. Locate only an exactly bound pull journal whose
+# recorded backup tree is the current physical directory.
+RECOVERY_SOURCE= RECOVERY_ROOT= RECOVERY_KIND=
+discover_interrupted_pull() {
+  local current token address journal txn_dir project state jcandidate jbackup
+  local jseen key value extra jschema= jtoken= joperation= jpre= jtarget= jpreowner= jtargetowner=
+  local sseen sroot= saddress= shost= sremote= skind= matches=0
+  current=$(pwd -P)
+  for journal in "$STATE_BASE"/targets/*/*/transactions/*/journal; do
+    [ -f "$journal" ] && [ ! -L "$journal" ] || continue
+    txn_dir=${journal%/journal}; token=${txn_dir##*/}
+    [[ "$token" =~ ^[0-9]+-[0-9]+$ ]] || continue
+    jseen='|'; jschema=; jtoken=; joperation=; jpre=; jtarget=; jpreowner=; jtargetowner=
+    jcandidate=; jbackup=
+    while IFS=$'\t' read -r key value extra || [ -n "$key" ]; do
+      [ -n "$key" ] && [ -z "${extra:-}" ] || { jseen=bad; break; }
+      case "$jseen" in *"|$key|"*) jseen=bad; break ;; esac
+      jseen="$jseen$key|"
+      case "$key" in
+        schema) jschema=$value ;; token) jtoken=$value ;; operation) joperation=$value ;;
+        pre_epoch) jpre=$value ;; target_epoch) jtarget=$value ;;
+        pre_owner) jpreowner=$value ;; target_owner) jtargetowner=$value ;;
+        candidate_container) jcandidate=$value ;; backup_container) jbackup=$value ;;
+        *) jseen=bad; break ;;
+      esac
+    done < "$journal"
+    [ "$jseen" != bad ] && [ "$jschema" = 2 ] && [ "$jtoken" = "$token" ] &&
+      [ "$joperation" = pull ] && valid_epoch "$jpre" && valid_epoch "$jtarget" &&
+      { [ "$jpreowner" = local ] || [ "$jpreowner" = remote ]; } &&
+      [ "$jtargetowner" = local ] && [ -n "$jcandidate" ] && [ -n "$jbackup" ] || continue
+    project=${txn_dir%/transactions/"$token"}; state="$project/state"
+    [ -f "$state" ] && [ ! -L "$state" ] || continue
+    sseen='|'; sroot=; saddress=; shost=; sremote=; skind=
+    while IFS=$'\t' read -r key value extra || [ -n "$key" ]; do
+      [ -n "$key" ] && [ -z "${extra:-}" ] || { sseen=bad; break; }
+      case "$sseen" in *"|$key|"*) sseen=bad; break ;; esac
+      sseen="$sseen$key|"
+      case "$key" in
+        local_root) sroot=$value ;; address) saddress=$value ;; host) shost=$value ;;
+        remote_root) sremote=$value ;; identity_kind) skind=$value ;;
+      esac
+    done < "$state"
+    [ "$sseen" != bad ] && [ "$shost" = "$HOST" ] && [ "$sremote" = "$REMOTE_ROOT" ] &&
+      { [ "$skind" = git ] || [ "$skind" = non-git ]; } || continue
+    case "$sroot" in /*) ;; *) continue ;; esac
+    address=$saddress
+    case "$jcandidate" in "${sroot%/*}/.ompup-candidate-$address-$token."??????) ;; *) continue ;; esac
+    case "$jbackup" in "${sroot%/*}/.ompup-backup-$address-$token."??????) ;; *) continue ;; esac
+    [ "$jbackup/tree" = "$current" ] || continue
+    matches=$((matches + 1)); RECOVERY_SOURCE=$current; RECOVERY_ROOT=$sroot; RECOVERY_KIND=$skind
+  done
+  [ "$matches" -le 1 ] || die "multiple pull recovery journals match the surviving directory"
+}
+discover_interrupted_pull
+
+
+# All values embedded in remote shell programs pass through this encoder.
+sq() {
+  local value=$1
+  printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
+}
+REMOTE_MOVE_EXACT='move_platform() { if mv --help 2>&1 | grep -q -- "--no-target-directory"; then mv -T "$1" "$2"; else mv -h "$1" "$2"; fi; }; absolute_slot() { local path=$1 parent name physical; case "$path" in */*) parent=${path%/*}; name=${path##*/}; [ -n "$parent" ] || parent=/ ;; *) parent=.; name=$path ;; esac; physical=$(cd "$parent" && pwd -P) || return 1; if [ "$physical" = / ]; then printf "/%s" "$name"; else printf "%s/%s" "$physical" "$name"; fi; }; tracked_move() ( local source=$1 destination=$2 tracker tracker_pid= moved=0 actual; tracker=$(mktemp -d "${TMPDIR:-/tmp}/ompup-move.XXXXXX") || return 1; trap '"'"'[ -z "$tracker_pid" ] || kill "$tracker_pid" 2>/dev/null || true; rm -rf "$tracker"'"'"' EXIT HUP INT TERM; ( cd "$source" || exit 1; : > "$tracker/ready"; while [ ! -e "$tracker/go" ]; do :; done; pwd -P > "$tracker/actual"; ) & tracker_pid=$!; while [ ! -e "$tracker/ready" ]; do kill -0 "$tracker_pid" 2>/dev/null || { wait "$tracker_pid" || true; return 1; }; done; if move_platform "$source" "$destination"; then moved=1; fi; : > "$tracker/go"; wait "$tracker_pid" || return 1; tracker_pid=; IFS= read -r actual < "$tracker/actual" || return 1; [ "$moved" -eq 1 ] || return 1; printf "%s" "$actual"; ); move_exact() { local source destination actual rollback_actual; source=$(absolute_slot "$1") || return 1; destination=$(absolute_slot "$2") || return 1; actual=$(tracked_move "$source" "$destination") || return 1; [ "$actual" = "$destination" ] && return 0; if [ ! -e "$source" ] && [ ! -L "$source" ]; then if ! rollback_actual=$(tracked_move "$actual" "$source"); then printf "ompup: exact-move rollback failed; source may remain at %s\n" "$actual" >&2; return 1; fi; if [ "$rollback_actual" != "$source" ]; then printf "ompup: exact-move rollback target changed; source preserved at %s\n" "$rollback_actual" >&2; return 1; fi; fi; return 1; }'
+ssh_run() {
+  local script=$1
+  ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "bash -c $(sq "$script")"
+}
+ssh_read() {
+  local script=$1
+  ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "bash -c $(sq "$script")"
+}
+ssh_write() {
+  local script=$1 data=$2
+  printf '%s' "$data" | ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "bash -c $(sq "$script")"
+}
+
+# Remote managed directories are built one component at a time. Existing
+# symlinks or non-directories fail closed instead of being followed by
+# mkdir -p, writes, or later recursive cleanup.
+remote_safe_dir_prelude() {
+  cat <<'EOF'
+safe_dir() {
+  managed_path=$1
+  case "$managed_path" in ''|/*) echo "unsafe managed directory: $managed_path" >&2; exit 2 ;; esac
+  managed_oldifs=$IFS
+  IFS=/
+  set -- $managed_path
+  IFS=$managed_oldifs
+  managed_current=
+  for managed_component in "$@"; do
+    [ -n "$managed_component" ] && [ "$managed_component" != . ] && [ "$managed_component" != .. ] ||
+      { echo "unsafe managed directory component" >&2; exit 2; }
+    managed_current=${managed_current:+$managed_current/}$managed_component
+    [ ! -L "$managed_current" ] || { echo "managed directory is a symlink: $managed_current" >&2; exit 2; }
+    if [ -e "$managed_current" ]; then
+      [ -d "$managed_current" ] || { echo "managed path is not a directory: $managed_current" >&2; exit 2; }
+    else
+      mkdir "$managed_current" || exit 2
+      [ -d "$managed_current" ] && [ ! -L "$managed_current" ] ||
+        { echo "could not safely create managed directory: $managed_current" >&2; exit 2; }
+    fi
+  done
+}
+require_dir() {
+  managed_path=$1
+  case "$managed_path" in ''|/*) echo "unsafe managed directory: $managed_path" >&2; exit 2 ;; esac
+  managed_oldifs=$IFS
+  IFS=/
+  set -- $managed_path
+  IFS=$managed_oldifs
+  managed_current=
+  for managed_component in "$@"; do
+    managed_current=${managed_current:+$managed_current/}$managed_component
+    [ -d "$managed_current" ] && [ ! -L "$managed_current" ] ||
+      { echo "managed directory is missing or unsafe: $managed_current" >&2; exit 2; }
+  done
+}
+EOF
+}
+
+remote_control_dirs_script() {
+  printf '%s\nsafe_dir %s\nsafe_dir %s\nsafe_dir %s\n' \
+    "$(remote_safe_dir_prelude)" "$(sq "$REMOTE_ROOT")" "$(sq "$REMOTE_ROOT/.ompup-v2")" "$(sq "$REMOTE_CONTROL")"
+}
+
+remote_validate_tree_script() {
+  local dir=$1
+  cat <<EOF
 set -euo pipefail
-if [ "$3" = 1 ]; then tmux kill-session -t "=$1" 2>/dev/null || true; fi
-rm -rf "$HOME/$2"
-"""
-
-
-def die(message: str) -> "NoReturn":
-    print(f"ompup: {message}", file=sys.stderr)
-    raise SystemExit(1)
-
-
-def run(
-    args: list[str],
-    *,
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
-    check: bool = True,
-    capture: bool = False,
-    text: bool = True,
-) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        args,
-        cwd=cwd,
-        env=env,
-        check=check,
-        capture_output=capture,
-        text=text,
-    )
-
-
-def configure_ssh_transport(remote: str) -> None:
-    global SSH_CONTROL_PATH
-    control_dir = Path.home() / ".cache" / "ompup" / "ssh"
-    if control_dir.is_symlink() or (control_dir.exists() and not control_dir.is_dir()):
-        raise RuntimeError(f"SSH control path is not a private directory: {control_dir}")
-    control_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    control_dir.chmod(0o700)
-    remote_key = hashlib.sha256(remote.encode()).hexdigest()[:16]
-    SSH_CONTROL_PATH = str(control_dir / f"{os.getpid()}-{remote_key}")
-
-
-def ssh_transport_args() -> list[str]:
-    if not SSH_CONTROL_PATH:
-        return []
-    return [
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        "ControlPersist=60",
-        "-o",
-        f"ControlPath={SSH_CONTROL_PATH}",
-    ]
-
-
-def git_transport_env() -> dict[str, str]:
-    env = os.environ.copy()
-    env["GIT_SSH_COMMAND"] = shlex.join(["ssh", *ssh_transport_args()])
-    return env
-
-
-def rsync_args() -> list[str]:
-    return ["rsync", "-e", shlex.join(["ssh", *ssh_transport_args()])]
-
-
-def ssh_command(command: str, *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    return run(["ssh", *ssh_transport_args(), REMOTE, command], check=check, capture=capture)
-
-
-def ssh_script(
-    script: str,
-    *args: str,
-    check: bool = True,
-    capture: bool = False,
-) -> subprocess.CompletedProcess:
-    command = "bash -s -- " + " ".join(shlex.quote(arg) for arg in args)
-    return subprocess.run(
-        ["ssh", *ssh_transport_args(), REMOTE, command],
-        input=script,
-        text=True,
-        check=check,
-        capture_output=capture,
-    )
-
-
-def git(root: Path, *args: str, env: dict[str, str] | None = None, capture: bool = True) -> str:
-    result = run(["git", "-C", str(root), *args], env=env, capture=capture)
-    return result.stdout.strip() if capture else ""
-
-
-
-
-def project_identity(root: Path) -> tuple[str, str]:
-    result = run(
-        ["git", "-C", str(root), "remote", "get-url", "origin"],
-        check=False,
-        capture=True,
-    )
-    origin = result.stdout.strip() if result.returncode == 0 else ""
-    material = f"origin\0{origin}" if origin else f"path\0{root}"
-    identity = hashlib.sha256(material.encode()).hexdigest()
-
-    remote_origin = origin
-    parsed = urlsplit(origin)
-    sensitive_query = {"access_token", "auth", "key", "password", "signature", "token"}
-    if (
-        origin.startswith(("/", "file:"))
-        or parsed.password is not None
-        or (parsed.scheme in {"http", "https"} and parsed.username is not None)
-        or any(key.lower() in sensitive_query for key, _ in parse_qsl(parsed.query))
-    ):
-        remote_origin = ""
-    return identity, remote_origin
-
-
-def prepare_index(root: Path) -> tuple[Path, str, list[str]]:
-    git_dir = Path(git(root, "rev-parse", "--absolute-git-dir"))
-    handle = tempfile.NamedTemporaryFile(prefix="ompup-index-", delete=False)
-    index = Path(handle.name)
-    handle.close()
-    index.unlink()
-    if (git_dir / "index").is_file():
-        shutil.copy2(git_dir / "index", index)
-
-    env = os.environ.copy()
-    env["GIT_INDEX_FILE"] = str(index)
-    try:
-        git(root, "add", "-A", "--", ".", env=env, capture=False)
-        tree = git(root, "write-tree", env=env)
-        entries = git(root, "ls-files", "-z", env=env).split("\0")
-    except Exception:
-        index.unlink(missing_ok=True)
-        raise
-    return index, tree, [entry for entry in entries if entry]
-
-
-def repository_head(root: Path) -> str:
-    result = run(
-        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
-        check=False,
-        capture=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else "0" * 40
-def current_branch(root: Path) -> str:
-    result = run(
-        ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
-        check=False,
-        capture=True,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        die("detached HEAD is not supported; check out a local branch before synchronizing")
-    return result.stdout.strip()
-
-
-def local_state(root: Path) -> str:
-    index, tree, _ = prepare_index(root)
-    index.unlink(missing_ok=True)
-    return f"{repository_head(root)}:{tree}"
-
-
-def remote_exists(remote_dir: str) -> bool:
-    command = f"test -d {shlex.quote(remote_dir)}"
-    return ssh_command(command, check=False).returncode == 0
-
-
-def remote_state(remote_dir: str) -> str:
-    result = ssh_script(REMOTE_STATE_SCRIPT, remote_dir, capture=True)
-    return result.stdout.strip()
-
-
-def require_remote_command(command: str) -> None:
-    result = ssh_script('command -v "$1" >/dev/null 2>&1', command, check=False)
-    if result.returncode != 0:
-        die(f"required remote command not found on {REMOTE}: {command}")
-
-
-def session_exists(session: str) -> bool:
-    result = ssh_script('tmux has-session -t "=$1" 2>/dev/null', session, check=False)
-    return result.returncode == 0
-
-
-def read_baseline(state_key: str) -> tuple[str, str] | None:
-    result = ssh_script(READ_BASELINE_SCRIPT, state_key, check=False, capture=True)
-    if result.returncode == 3:
-        return None
-    if result.returncode != 0:
-        die("could not read remote synchronization state")
-    lines = result.stdout.splitlines()
-    if len(lines) != 2 or not re.fullmatch(r"[0-9a-f]{64}", lines[0]):
-        die("remote synchronization state is malformed")
-    return lines[0], lines[1]
-
-
-def write_baseline(state_key: str, identity: str, state: str) -> None:
-    ssh_script(WRITE_BASELINE_SCRIPT, state_key, identity, state)
-
-
-def validate_snapshot_paths(entries: list[str]) -> None:
-    for entry in entries:
-        path = Path(entry)
-        if any(part in PRESERVED_DIRS for part in path.parts):
-            die(f"unignored dependency/build path would transfer: {entry}")
-        name = path.name
-        if name in SENSITIVE_NAMES or name.startswith(".env.") or name.endswith((".pem", ".key")):
-            die(f"sensitive path requires explicit handling and will not transfer: {entry}")
-
-
-def operation_ref(kind: str, state_key: str) -> str:
-    key = hashlib.sha256(state_key.encode()).hexdigest()[:16]
-    nonce = os.urandom(6).hex()
-    return f"refs/ompup/{kind}/{key}-{os.getpid()}-{nonce}"
-
-
-def remote_repository(remote_dir: str) -> str:
-    return f"{REMOTE}:{remote_dir}"
-
-
-def delete_local_ref(root: Path, ref: str) -> None:
-    git(root, "update-ref", "-d", ref, capture=False)
-
-
-def delete_remote_ref(remote_dir: str, ref: str) -> None:
-    ssh_script(DELETE_REF_SCRIPT, remote_dir, ref, check=False)
-
-
-def push_ref(root: Path, repository: str, source: str, destination: str) -> None:
-    git(
-        root,
-        "push",
-        "-q",
-        repository,
-        f"{source}:{destination}",
-        env=git_transport_env(),
-        capture=False,
-    )
-
-
-def fetch_ref(root: Path, repository: str, source: str, destination: str) -> None:
-    git(
-        root,
-        "fetch",
-        "-q",
-        repository,
-        f"+{source}:{destination}",
-        env=git_transport_env(),
-        capture=False,
-    )
-
-
-def scan_snapshot_tree(root: Path, tree: str) -> None:
-    env = os.environ.copy()
-    env.update(
-        {
-            "GIT_AUTHOR_NAME": "ompup",
-            "GIT_AUTHOR_EMAIL": "ompup@localhost",
-            "GIT_COMMITTER_NAME": "ompup",
-            "GIT_COMMITTER_EMAIL": "ompup@localhost",
-            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
-            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
-        }
-    )
-    commit = git(root, "commit-tree", tree, "-m", "ompup snapshot", env=env)
-    result = run(
-        [
-            "gitleaks",
-            "git",
-            "--no-banner",
-            "--redact",
-            "--log-level",
-            "error",
-            f"--log-opts={commit}^!",
-            str(root),
-        ],
-        cwd=root,
-        check=False,
-        capture=True,
-    )
-    if result.returncode != 0:
-        die("secret scan rejected the working snapshot; review it locally with gitleaks")
-
-
-def scan_history(root: Path, revision: str = "") -> None:
-    command = ["gitleaks", "git", "--no-banner", "--redact", "--log-level", "error"]
-    if revision:
-        command.append(f"--log-opts={revision}")
-    command.append(str(root))
-    result = run(command, cwd=root, check=False, capture=True)
-    if result.returncode != 0:
-        scope = "incoming Git history" if revision else "reachable Git history"
-        die(f"secret scan rejected {scope}; review it locally with gitleaks")
-
-
-def prepare_snapshot(root: Path) -> tuple[str, str]:
-    head = repository_head(root)
-    index, tree, entries = prepare_index(root)
-    try:
-        validate_snapshot_paths(entries)
-    finally:
-        index.unlink(missing_ok=True)
-    if repository_head(root) != head:
-        die("local HEAD changed while its snapshot was being prepared; retry")
-    scan_snapshot_tree(root, tree)
-    return f"{head}:{tree}", tree
-
-
-def push_object(root: Path, remote_dir: str, object_name: str, remote_ref: str) -> None:
-    local_ref = operation_ref("outgoing", remote_ref)
-    git(root, "update-ref", local_ref, object_name, capture=False)
-    try:
-        push_ref(root, remote_repository(remote_dir), local_ref, remote_ref)
-    finally:
-        delete_local_ref(root, local_ref)
-
-
-def publish_commit(
-    root: Path,
-    state_key: str,
-    remote_dir: str,
-    branch: str,
-    expected_old: str,
-    expected_new: str,
-) -> None:
-    remote_ref = operation_ref("commits", state_key)
-    try:
-        push_object(root, remote_dir, expected_new, remote_ref)
-        result = ssh_script(
-            APPLY_COMMIT_SCRIPT,
-            remote_dir,
-            remote_ref,
-            branch,
-            expected_old,
-            expected_new,
-            check=False,
-            capture=True,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "remote Git rejected the update"
-            die(f"could not fast-forward remote commits: {detail}")
-    finally:
-        delete_remote_ref(remote_dir, remote_ref)
-
-
-def publish_snapshot(root: Path, state_key: str, remote_dir: str, state: str, tree: str) -> None:
-    expected_head = state.split(":", 1)[0]
-    remote_ref = operation_ref("snapshots", state_key)
-    try:
-        push_object(root, remote_dir, tree, remote_ref)
-        result = ssh_script(
-            APPLY_SNAPSHOT_SCRIPT,
-            remote_dir,
-            remote_ref,
-            tree,
-            expected_head,
-            check=False,
-            capture=True,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "remote Git rejected the snapshot"
-            die(f"could not apply remote working snapshot: {detail}")
-    finally:
-        delete_remote_ref(remote_dir, remote_ref)
-
-
-def bootstrap(
-    root: Path,
-    project: str,
-    state_key: str,
-    remote_dir: str,
-    identity: str,
-    origin: str,
-) -> str:
-    del project
-    branch = current_branch(root)
-    expected, tree = prepare_snapshot(root)
-    head = expected.split(":", 1)[0]
-    ssh_script(BOOTSTRAP_SCRIPT, remote_dir, branch, origin)
-    try:
-        if head != "0" * 40:
-            scan_history(root)
-            publish_commit(root, state_key, remote_dir, branch, "0" * 40, head)
-        if local_state(root) != expected:
-            die("local checkout changed while its snapshot was being prepared; retry")
-        publish_snapshot(root, state_key, remote_dir, expected, tree)
-        actual = remote_state(remote_dir)
-        if actual != expected:
-            die("remote checkout did not match the prepared snapshot; synchronization state was not recorded")
-    except BaseException:
-        ssh_script(REMOVE_REMOTE_PROJECT_SCRIPT, remote_dir, check=False)
-        raise
-    write_baseline(state_key, identity, actual)
-    print(f"ompup: bootstrapped {REMOTE}:~/{remote_dir}")
-    return actual
-
-
-def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
-    if ancestor == "0" * 40:
-        return True
-    result = run(
-        ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant],
-        check=False,
-    )
-    return result.returncode == 0
-
-
-def fast_forward_remote(root: Path, project: str, state_key: str, remote_dir: str, remote_head: str) -> None:
-    del project
-    local_head = repository_head(root)
-    if not is_ancestor(root, remote_head, local_head):
-        die("local commit history is not a fast-forward of the remote; reconcile it with Git")
-    branch = current_branch(root)
-    scan_history(root, f"{remote_head}..{local_head}" if remote_head != "0" * 40 else local_head)
-    publish_commit(root, state_key, remote_dir, branch, remote_head, local_head)
-    print(f"ompup: fast-forwarded remote commits to {local_head[:10]}")
-
-
-def fast_forward_local(root: Path, project: str, state_key: str, remote_dir: str, remote_head: str) -> None:
-    del project
-    local_head = repository_head(root)
-    branch_result = ssh_command(
-        f"git -C {shlex.quote(remote_dir)} symbolic-ref --quiet --short HEAD",
-        check=False,
-        capture=True,
-    )
-    if branch_result.returncode != 0:
-        die("could not determine the remote branch")
-    branch = branch_result.stdout.strip()
-    local_branch = current_branch(root)
-    if local_branch != branch:
-        die(f"branch mismatch: local={local_branch} remote={branch}")
-
-    local_ref = operation_ref("incoming", state_key)
-    try:
-        fetch_ref(root, remote_repository(remote_dir), f"refs/heads/{branch}", local_ref)
-        incoming = git(root, "rev-parse", f"{local_ref}^{{commit}}")
-        if incoming != remote_head or not is_ancestor(root, local_head, incoming):
-            die("remote commit history is not a fast-forward of local; reconcile it with Git")
-        scan_history(root, f"{local_head}..{incoming}" if local_head != "0" * 40 else incoming)
-        git(root, "reset", "--hard", "-q", incoming, capture=False)
-    finally:
-        delete_local_ref(root, local_ref)
-    print(f"ompup: fast-forwarded local commits to {incoming[:10]}")
-
-
-def assert_identity(state_key: str, remote_dir: str, identity: str, local: str, remote: str) -> str:
-    baseline = read_baseline(state_key)
-    if baseline is None:
-        if local != remote:
-            die("existing remote checkout predates safe sync and differs locally; reconcile it with Git first")
-        write_baseline(state_key, identity, remote)
-        return remote
-    recorded_identity, recorded_state = baseline
-    if recorded_identity != identity:
-        die(f"~/{remote_dir} maps to a different local repository; choose a distinct project name")
-    return recorded_state
-
-
-def sync_up(
-    root: Path,
-    project: str,
-    state_key: str,
-    remote_dir: str,
-    identity: str,
-    origin: str,
-) -> None:
-    local = local_state(root)
-    if not remote_exists(remote_dir):
-        bootstrap(root, project, state_key, remote_dir, identity, origin)
-        return
-
-    remote = remote_state(remote_dir)
-    baseline = assert_identity(state_key, remote_dir, identity, local, remote)
-    if local == remote:
-        write_baseline(state_key, identity, remote)
-        print("ompup: local and remote snapshots already match")
-        return
-    if remote != baseline:
-        die("remote working state changed since the last sync; run `ompup pull` or resolve the conflict")
-    local_head, remote_head = local.split(":", 1)[0], remote.split(":", 1)[0]
-    if local_head != remote_head:
-        fast_forward_remote(root, project, state_key, remote_dir, remote_head)
-
-    expected, tree = prepare_snapshot(root)
-    if expected != local:
-        die("local checkout changed while its snapshot was being prepared; retry")
-    publish_snapshot(root, state_key, remote_dir, expected, tree)
-
-    actual = remote_state(remote_dir)
-    if actual != local:
-        die("remote verification did not match the local snapshot; synchronization state was not advanced")
-    write_baseline(state_key, identity, actual)
-    print("ompup: synchronized local working state to remote")
-
-
-def fetch_snapshot(root: Path, state_key: str, remote_dir: str, state: str) -> None:
-    expected_head, expected_tree = state.split(":", 1)
-    remote_ref = operation_ref("snapshots", state_key)
-    local_ref = operation_ref("incoming", state_key)
-    try:
-        result = ssh_script(
-            CREATE_SNAPSHOT_REF_SCRIPT,
-            remote_dir,
-            expected_head,
-            expected_tree,
-            remote_ref,
-            check=False,
-            capture=True,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "remote snapshot export failed"
-            die(f"could not export remote working snapshot: {detail}")
-        before = local_state(root)
-        fetch_ref(root, remote_repository(remote_dir), remote_ref, local_ref)
-        incoming = git(root, "rev-parse", f"{local_ref}^{{tree}}")
-        if incoming != expected_tree:
-            die(f"fetched snapshot mismatch: expected={expected_tree} actual={incoming}")
-        scan_snapshot_tree(root, incoming)
-        if local_state(root) != before:
-            die("local checkout changed while the remote snapshot was being fetched; retry")
-        run(["git", "-C", str(root), "read-tree", "--dry-run", "--reset", "-u", incoming])
-        run(["git", "-C", str(root), "read-tree", "--reset", "-u", incoming])
-    finally:
-        delete_local_ref(root, local_ref)
-        delete_remote_ref(remote_dir, remote_ref)
-
-
-def sync_down(root: Path, project: str, state_key: str, remote_dir: str, identity: str) -> None:
-    if not remote_exists(remote_dir):
-        die(f"nothing at {REMOTE}:~/{remote_dir}")
-    local = local_state(root)
-    remote = remote_state(remote_dir)
-    baseline = assert_identity(state_key, remote_dir, identity, local, remote)
-    if local == remote:
-        write_baseline(state_key, identity, remote)
-        print("ompup: local and remote snapshots already match")
-        return
-    if local != baseline:
-        if remote == baseline:
-            die("remote has no changes to download; local working state changed")
-        die("both local and remote working states changed since the last sync; resolve the conflict")
-    local_head, remote_head = local.split(":", 1)[0], remote.split(":", 1)[0]
-    if local_head != remote_head:
-        fast_forward_local(root, project, state_key, remote_dir, remote_head)
-
-    fetch_snapshot(root, state_key, remote_dir, remote)
-    actual = local_state(root)
-    if actual != remote:
-        die("local verification did not match the remote snapshot; synchronization state was not advanced")
-    write_baseline(state_key, identity, actual)
-    print("ompup: synchronized remote working state to local")
-    run(["git", "-C", str(root), "status", "--short"], check=False)
-
-
-def show_status(
-    root: Path,
-    state_key: str,
-    remote_dir: str,
-    identity: str,
-    session: str,
-) -> None:
-    local = local_state(root)
-    print(f"== local ({root})")
-    run(["git", "-C", str(root), "status", "--short", "--branch"], check=False)
-    if not remote_exists(remote_dir):
-        print(f"== remote ({REMOTE}:~/{remote_dir})\n(no checkout)\n== tmux\n(no session {session})")
-        return
-    remote = remote_state(remote_dir)
-    baseline_data = read_baseline(state_key)
-    print(f"== remote ({REMOTE}:~/{remote_dir})")
-    ssh_command(f"git -C {shlex.quote(remote_dir)} status --short --branch", check=False)
-    print("== sync")
-    if baseline_data is None:
-        print("unregistered existing checkout")
-    elif baseline_data[0] != identity:
-        print("project identity mismatch")
-    elif local == remote:
-        print("local and remote match")
-    elif local.split(":", 1)[0] != remote.split(":", 1)[0]:
-        print("commits differ; synchronize with Git before transferring working state")
-    elif local == baseline_data[1]:
-        print("remote changed; `ompup pull` is safe")
-    elif remote == baseline_data[1]:
-        print("local changed; `ompup sync` is safe")
-    else:
-        print("both sides changed; manual resolution required")
-    print("== tmux")
-    print(f"session {session} is {'running' if session_exists(session) else 'not running'}")
-
-
-def session_environment(session: str) -> str:
-    result = ssh_command(
-        f"tmux show-options -v -t {shlex.quote(session)} @ompup-environment",
-        check=False,
-        capture=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else ""
-
-
-def attach(session: str, remote_dir: str, launch: str, fingerprint: str) -> None:
-    quoted_session = shlex.quote(session)
-    quoted_target = shlex.quote("=" + session)
-    quoted_option_target = shlex.quote(session)
-    create = (
-        f"tmux new-session -d -s {quoted_session} "
-        f'-c \"$HOME/{remote_dir}\"'
-    )
-    if launch:
-        create += " " + shlex.quote(f'{launch}; exec \"$SHELL\"')
-    if fingerprint:
-        existing_check = (
-            f"actual=$(tmux show-options -v -t {quoted_option_target} @ompup-environment 2>/dev/null || true); "
-            f"[ \"$actual\" = {shlex.quote(fingerprint)} ] || "
-            f"{{ printf 'tmux session environment mismatch\\n' >&2; exit 7; }}; "
-        )
-        record_environment = (
-            f"tmux set-option -t {quoted_option_target} @ompup-environment "
-            f"{shlex.quote(fingerprint)}; "
-        )
-    else:
-        existing_check = ""
-        record_environment = ""
-    command = (
-        f"if tmux has-session -t {quoted_target} 2>/dev/null; then "
-        f"{existing_check}"
-        f"exec tmux attach-session -t {quoted_target}; fi; "
-        f"{create}; "
-        f"{record_environment}"
-        f"exec tmux attach-session -t {quoted_target}"
-    )
-    os.execvp("ssh", ["ssh", *ssh_transport_args(), "-t", REMOTE, command])
-
-
-def add_project_arguments(parser: argparse.ArgumentParser, *, cmux: bool = False) -> None:
-    parser.add_argument("project", nargs="?", help="project name or path; defaults to the current Git repository")
-    parser.add_argument("--pick", action="store_true", help="choose interactively from the projects directory")
-    parser.add_argument("--host", default="", help="configured host name or SSH destination")
-    parser.add_argument(
-        "--profile",
-        default="auto",
-        help="host capability role (auto detects macos; custom configured roles are accepted)",
-    )
-    if cmux:
-        parser.add_argument("--cmux", action="store_true", help="open or reuse a cmux workspace")
-
-
-def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="ompup",
-        description="Safely continue a local Git project inside persistent OMP on a remote machine.",
-    )
-    parser.add_argument("--version", action="version", version=f"ompup {VERSION}")
-    commands = parser.add_subparsers(dest="command", required=True)
-    for name, help_text in (
-        ("up", "bootstrap or sync when needed, then attach OMP"),
-        ("shell", "bootstrap or sync when needed, then attach a shell"),
-        ("sync", "transfer local commits and working state without attaching"),
-        ("pull", "transfer remote commits and working state to local"),
-        ("status", "show selected host, synchronization, and tmux state"),
-        ("doctor", "probe configured hosts and explain selection"),
-    ):
-        subparser = commands.add_parser(name, help=help_text)
-        add_project_arguments(subparser, cmux=name in {"up", "shell"})
-    handoff_parser = commands.add_parser(
-        "handoff",
-        help="move a live local OMP session into remote tmux and replace its cmux surface",
-    )
-    add_project_arguments(handoff_parser)
-    handoff_parser.add_argument("--session-file", required=True, help=argparse.SUPPRESS)
-    handoff_parser.add_argument("--artifacts-dir", default="", help=argparse.SUPPRESS)
-    handoff_parser.add_argument("--session-id", required=True, help=argparse.SUPPRESS)
-    handoff_parser.add_argument(
-        "--prepare-only",
-        action="store_true",
-        help="prepare and verify remote OMP without replacing the local terminal",
-    )
-    hosts_parser = commands.add_parser("hosts", help="probe every configured host")
-    hosts_parser.add_argument("--json", action="store_true", help="emit probe data as JSON")
-    pin_parser = commands.add_parser("pin", help="pin a project to one configured host")
-    pin_parser.add_argument("host")
-    pin_parser.add_argument("project", nargs="?")
-    pin_parser.add_argument("--pick", action="store_true")
-    unpin_parser = commands.add_parser("unpin", help="remove a project's host pin")
-    unpin_parser.add_argument("project", nargs="?")
-    unpin_parser.add_argument("--pick", action="store_true")
-    env_parser = commands.add_parser("env", help="manage shared OMP environment parity")
-    env_commands = env_parser.add_subparsers(dest="env_command", required=True)
-    for name, help_text in (
-        ("status", "compare shared OMP configuration on remote machines"),
-        ("sync", "synchronize shared OMP configuration to remote machines"),
-    ):
-        env_subparser = env_commands.add_parser(name, help=help_text)
-        env_subparser.add_argument("--host", action="append", default=[], help="configured host name or SSH destination")
-        env_subparser.add_argument("--all", action="store_true", help="target every configured host")
-        if name == "status":
-            env_subparser.add_argument("--json", action="store_true", help="emit status as JSON")
-    auth_parser = commands.add_parser("auth", help="configure and verify the shared OMP auth broker")
-    auth_commands = auth_parser.add_subparsers(dest="auth_command", required=True)
-    auth_commands.add_parser("setup", help="provision the broker token and configure this machine")
-    auth_commands.add_parser("status", help="verify local broker authentication")
-    migrate_parser = auth_commands.add_parser("migrate", help="migrate local stored credentials to the broker")
-    migrate_parser.add_argument("--dry-run", action="store_true", help="show migrations without writing")
-    return parser
-
-
-def parse_args() -> argparse.Namespace:
-    argv = sys.argv[1:]
-    commands = {"up", "shell", "sync", "pull", "status", "doctor", "hosts", "pin", "unpin", "handoff", "env", "auth"}
-    if not argv:
-        argv = ["up"]
-    elif argv[0] not in commands and argv[0] not in {"-h", "--help", "--version"}:
-        argv.insert(0, "up")
-    return create_parser().parse_args(argv)
-
-
-def validate_local_requirements(args: argparse.Namespace) -> None:
-    if not REMOTE_ROOT or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", REMOTE_ROOT):
-        die("OMPUP_REMOTE_ROOT must be a relative path of safe directory names")
-    if any(part in {".", ".."} for part in REMOTE_ROOT.split("/")):
-        die("OMPUP_REMOTE_ROOT cannot contain . or ..")
-    if os.environ.get("OMPUP_EXCLUDES"):
-        die("OMPUP_EXCLUDES is no longer supported; use .gitignore or .git/info/exclude")
-    if args.command == "hosts":
-        required = ("ssh",)
-    elif args.command in {"pin", "unpin"}:
-        required = ("git",)
-    elif args.command in {"status", "doctor"}:
-        required = ("git", "ssh")
-    elif args.command == "auth":
-        required = ("ssh", "omp")
-    elif args.command == "env":
-        required = ("ssh", "omp") if args.env_command == "status" else ("ssh", "omp", "gitleaks")
-    elif args.command == "handoff":
-        required = ("git", "ssh", "rsync", "gitleaks")
-    else:
-        required = ("git", "ssh", "gitleaks")
-    for executable in required:
-        if shutil.which(executable) is None:
-            die(f"required local command not found: {executable}")
-
-
-def host_context(
-    root: Path,
-    project: str,
-    requested_host: str,
-    requested_profile: str,
-    *,
-    persist: bool = True,
-    probe_all: bool = False,
-) -> tuple[HostChoice, list[HostProbe], str, str, str]:
-    global LAUNCH, REMOTE
-    session = project
-    hosts = load_hosts(LEGACY_HOST)
-    profile = project_profile(root, requested_profile)
-    explicit = requested_host or (LEGACY_HOST if LEGACY_HOST not in {"", "auto"} else "")
-    requested = explicit or pinned_host(root)
-    probe_targets = hosts if probe_all or not requested else [find_host(hosts, requested)]
-    probes = probe_hosts(probe_targets, project, session, REMOTE_ROOT)
-    choice = choose_host(hosts, probes, root, profile, explicit)
-    remote_dir = choice.probe.remote_dir
-    REMOTE = choice.host.ssh
-    configure_ssh_transport(REMOTE)
-    LAUNCH = LAUNCH_OVERRIDE or choice.host.launch
-    if persist and not pinned_host(root):
-        pin_host(root, choice.host.name)
-    state_key = f"{hashlib.sha256(remote_dir.encode()).hexdigest()[:16]}-{project}"
-    return choice, probes, remote_dir, session, state_key
-
-
-def print_banner(root: Path, project: str, choice: HostChoice, profile: str) -> None:
-    status = git(root, "status", "--porcelain")
-    branch_result = run(
-        ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
-        check=False,
-        capture=True,
-    )
-    branch = branch_result.stdout.strip() or "detached"
-    dirty = len(status.splitlines()) if status else 0
-    probe = choice.probe
-    print(
-        f"ompup: {project} -> {choice.host.name} ({choice.reason}); "
-        f"{probe.system}/{probe.arch}, {probe.free_gb:.0f} GB free, "
-        f"load {probe.load1:.2f}/{probe.cpu_count} CPU; "
-        f"{branch}, {dirty} changed path{'s' if dirty != 1 else ''}; profile {profile}"
-    )
-
-
-def show_hosts(as_json: bool = False) -> None:
-    hosts = load_hosts(LEGACY_HOST)
-    probes = probe_hosts(hosts, ".ompup-probe", ".ompup-probe", REMOTE_ROOT)
-    if as_json:
-        print(
-            json.dumps(
-                [
-                    {
-                        "name": probe.host.name,
-                        "ssh": probe.host.ssh,
-                        "roles": probe.host.roles,
-                        "reachable": probe.reachable,
-                        "tools_ok": probe.tools_ok,
-                        "system": probe.system,
-                        "arch": probe.arch,
-                        "cpu_count": probe.cpu_count,
-                        "load1": probe.load1,
-                        "memory_available": probe.memory_available,
-                        "disk_free": probe.disk_free,
-                        "latency_ms": probe.latency_ms,
-                        "error": probe.error,
-                    }
-                    for probe in probes
-                ],
-                indent=2,
-            )
-        )
-        return
-    for probe in probes:
-        print(format_probe(probe))
-
-
-def open_cmux(root: Path, project: str, host_name: str, command: str) -> None:
-    if shutil.which("cmux") is None:
-        die("cmux is not installed")
-    if run(["cmux", "ping"], check=False, capture=True).returncode != 0:
-        die("cmux is installed but no live runtime is reachable")
-    title = f"ompup:{project}@{host_name}"
-    result = run(["cmux", "workspace", "list", "--json"], capture=True)
-    payload = json.loads(result.stdout)
-    existing = next(
-        (
-            workspace
-            for workspace in payload.get("workspaces", [])
-            if workspace.get("custom_title") == title or workspace.get("title") == title
-        ),
-        None,
-    )
-    if existing:
-        run(["cmux", "workspace", "select", existing["ref"]])
-        print(f"ompup: selected existing cmux workspace {title}")
-        return
-    executable = str(Path(__file__).resolve())
-    launch_command = " ".join(
-        shlex.quote(part)
-        for part in (executable, command, str(root), "--host", host_name)
-    )
-    run(
-        [
-            "cmux",
-            "workspace",
-            "create",
-            "--name",
-            title,
-            "--description",
-            f"Persistent remote OMP on {host_name}",
-            "--cwd",
-            str(root),
-            "--command",
-            launch_command,
-            "--focus",
-            "true",
-        ]
-    )
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def validate_handoff_launch(launch: str) -> None:
-    if not re.fullmatch(r"(?:\$HOME/|~/|/)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", launch):
-        die("handoff requires the selected host launch setting to be one executable path")
-
-
-def ensure_cmux_runtime() -> None:
-    if shutil.which("cmux") is None:
-        die("session handoff requires cmux")
-    if run(["cmux", "ping"], check=False, capture=True).returncode != 0:
-        die("session handoff requires a live cmux runtime")
-
-
-def cmux_caller() -> tuple[str, str] | None:
-    result = run(["cmux", "identify"], check=False, capture=True)
-    if result.returncode != 0:
-        return None
-    try:
-        caller = json.loads(result.stdout).get("caller")
-    except json.JSONDecodeError:
-        return None
-    if not caller or caller.get("surface_type") != "terminal":
-        return None
-    window = caller.get("window_ref")
-    surface = caller.get("surface_ref")
-    if not isinstance(window, str) or not isinstance(surface, str):
-        return None
-    return window, surface
-
-
-def handoff_attach_command(session: str) -> str:
-    remote_command = f"tmux attach-session -t {shlex.quote('=' + session)}"
-    ssh = shlex.join(["ssh", *ssh_transport_args(), "-t", REMOTE, remote_command])
-    return f'{ssh}; exec "$SHELL" -l'
-
-
-def replace_or_open_cmux(root: Path, project: str, host_name: str, session: str) -> str:
-    command = handoff_attach_command(session)
-    caller = cmux_caller()
-    if caller:
-        window, surface = caller
-        result = run(
-            [
-                "cmux",
-                "respawn-pane",
-                "--window",
-                window,
-                "--surface",
-                surface,
-                "--command",
-                command,
-            ],
-            check=False,
-            capture=True,
-        )
-        if result.returncode == 0:
-            return "replaced current cmux surface"
-
-    run(
-        [
-            "cmux",
-            "workspace",
-            "create",
-            "--name",
-            f"ompup:{project}@{host_name}",
-            "--description",
-            f"Handed-off OMP session on {host_name}",
-            "--cwd",
-            str(root),
-            "--command",
-            command,
-            "--focus",
-            "true",
-        ]
-    )
-    if caller:
-        window, surface = caller
-        closed = run(
-            ["cmux", "close-surface", "--window", window, "--surface", surface],
-            check=False,
-            capture=True,
-        )
-        if closed.returncode == 0:
-            return "opened fallback cmux workspace and closed the local surface"
-    return "opened fallback cmux workspace"
-
-
-def cleanup_handoff(session: str, handoff_dir: str, *, kill_session: bool) -> None:
-    ssh_script(CLEANUP_HANDOFF_SCRIPT, session, handoff_dir, "1" if kill_session else "0", check=False)
-
-
-def handoff_session(
-    root: Path,
-    project: str,
-    remote_dir: str,
-    session: str,
-    state_key: str,
-    identity: str,
-    origin: str,
-    choice: HostChoice,
-    args: argparse.Namespace,
-    environment_fingerprint: str,
-) -> None:
-    session_file = Path(args.session_file).expanduser().resolve()
-    if not session_file.is_file() or session_file.suffix != ".jsonl":
-        die("active OMP session file is missing or is not JSONL")
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.session_id):
-        die("active OMP session ID is not safe for remote storage")
-    artifacts_dir = Path(args.artifacts_dir).expanduser().resolve() if args.artifacts_dir else None
-    if artifacts_dir and artifacts_dir.exists() and (not artifacts_dir.is_dir() or artifacts_dir.is_symlink()):
-        die("active OMP artifact path is not a regular directory")
-    validate_handoff_launch(LAUNCH)
-    require_remote_command("rsync")
-    if not args.prepare_only:
-        ensure_cmux_runtime()
-    if session_exists(session):
-        die(f"remote tmux session {session!r} already exists; attach it or choose another host")
-
-    sync_up(root, project, state_key, remote_dir, identity, origin)
-    if session_exists(session):
-        die(f"remote tmux session {session!r} appeared during synchronization; local OMP was preserved")
-
-    handoff_dir = f".local/state/ompup/handoffs/{project}/{args.session_id}"
-    remote_session_file = f"{handoff_dir}/session.jsonl"
-    source_hash = file_sha256(session_file)
-    ssh_script(PREPARE_HANDOFF_SCRIPT, handoff_dir)
-    remote_started = False
-    try:
-        run([*rsync_args(), "-a", "--partial", str(session_file), f"{REMOTE}:{remote_session_file}"])
-        if artifacts_dir and artifacts_dir.is_dir():
-            run(
-                [
-                    *rsync_args(),
-                    "-a",
-                    "--partial",
-                    str(artifacts_dir) + os.sep,
-                    f"{REMOTE}:{handoff_dir}/session/",
-                ]
-            )
-        if file_sha256(session_file) != source_hash:
-            die("local OMP session changed during transfer; local OMP was preserved")
-
-        verified = ssh_script(
-            VERIFY_HANDOFF_SCRIPT,
-            handoff_dir,
-            source_hash,
-            LAUNCH,
-            check=False,
-            capture=True,
-        )
-        if verified.returncode != 0:
-            detail = verified.stderr.strip().splitlines()[-1] if verified.stderr.strip() else "remote export failed"
-            die(f"remote OMP could not load the transferred session: {detail}")
-
-        started = ssh_script(
-            START_HANDOFF_SCRIPT,
-            remote_dir,
-            session,
-            remote_session_file,
-            LAUNCH,
-            environment_fingerprint,
-            check=False,
-            capture=True,
-        )
-        if started.returncode != 0:
-            detail = started.stderr.strip().splitlines()[-1] if started.stderr.strip() else "remote OMP did not stay running"
-            die(f"remote OMP did not become attachable: {detail}")
-        remote_started = True
-
-        if args.prepare_only:
-            print(
-                f"ompup: remote session ready on {choice.host.name}; "
-                f"attach with `ssh -t {REMOTE} {shlex.quote(f'tmux attach-session -t ={session}')}`"
-            )
-            return
-        mode = replace_or_open_cmux(root, project, choice.host.name, session)
-        print(f"ompup: {mode}; remote session {args.session_id} verified")
-    except BaseException:
-        cleanup_handoff(session, handoff_dir, kill_session=remote_started)
-        raise
-
-
-def run_doctor(root: Path, project: str, args: argparse.Namespace) -> None:
-    choice, probes, remote_dir, session, _ = host_context(
-        root, project, args.host, args.profile, persist=False, probe_all=True
-    )
-    for probe in probes:
-        marker = "*" if probe.host.name == choice.host.name else " "
-        print(f"{marker} {format_probe(probe)}")
-    print(f"selected {choice.host.name}: {choice.reason}")
-    print(f"remote path ~/{remote_dir}; tmux session {session}")
-
-
-def run_environment_command(args: argparse.Namespace) -> None:
-    hosts = load_hosts(LEGACY_HOST)
-    selected = select_hosts(hosts, args.host, args.all)
-    config = load_environment_config()
-    if config.mode == "preserve":
-        if args.env_command == "sync":
-            raise RuntimeError(
-                "environment sync is disabled in preserve mode; set environment.mode to mirror explicitly"
-            )
-        statuses = [preserved_environment_status(host) for host in selected]
-        if args.json:
-            print(
-                json.dumps(
-                    {
-                        "mode": "preserve",
-                        "hosts": [
-                            {
-                                "name": status.host.name,
-                                "reachable": status.reachable,
-                                "ok": status.ok,
-                                "ompVersion": status.omp_version,
-                                "error": status.error,
-                            }
-                            for status in statuses
-                        ],
-                    },
-                    indent=2,
-                )
-            )
-        else:
-            print("local: preserve remote OMP configuration")
-            for status in statuses:
-                print(format_environment_status(status))
-        return
-
-    token = None
-    if args.env_command == "sync" and config.broker_url:
-        bootstrap_auth(hosts)
-        token_path = CONFIG_ROOT / "auth-broker.token"
-        if not token_path.is_file():
-            raise RuntimeError(
-                f"auth broker token is missing at {token_path}; run `ompup auth setup`"
-            )
-        token = token_path.read_bytes()
-
-    results: list[tuple[object, object]] = []
-    failures: list[str] = []
-    for host in selected:
-        release = build_release(config, host)
-        try:
-            status = environment_status(host)
-            expected_version = str(release.manifest["ompVersion"])
-            ready = (
-                status.ok
-                and status.fingerprint == release.fingerprint
-                and status.omp_version == expected_version
-            )
-            if args.env_command == "sync" and not ready:
-                try:
-                    status = sync_environment(host, release, token)
-                except RuntimeError as error:
-                    failures.append(f"{host.name}: {error}")
-                    print(f"ompup: {host.name}: {error}", file=sys.stderr)
-            results.append((release, status))
-        finally:
-            cleanup_release(release)
-    if failures:
-        raise RuntimeError(f"environment sync failed for {len(failures)} host(s)")
-
-    if args.json:
-        print(
-            json.dumps(
-                {
-                    "mode": "mirror",
-                    "hosts": [
-                        {
-                            "name": status.host.name,
-                            "reachable": status.reachable,
-                            "ok": status.ok and status.fingerprint == release.fingerprint,
-                            "expectedFingerprint": release.fingerprint,
-                            "fingerprint": status.fingerprint,
-                            "expectedOmpVersion": release.manifest["ompVersion"],
-                            "ompVersion": status.omp_version,
-                            "mismatches": status.mismatches,
-                            "error": status.error,
-                            "excludedExtensions": release.manifest["excludedExtensions"],
-                        }
-                        for release, status in results
-                    ],
-                },
-                indent=2,
-            )
-        )
-        return
-    for release, status in results:
-        print(format_environment_status(status, release.fingerprint))
-        if release.manifest["excludedExtensions"]:
-            print(
-                f"{status.host.name} host-local extensions: "
-                + ", ".join(release.manifest["excludedExtensions"])
-            )
-
-
-def run_auth_command(args: argparse.Namespace) -> None:
-    hosts = load_hosts(LEGACY_HOST)
-    if args.auth_command == "setup":
-        config, changed = bootstrap_auth(hosts)
-        print(f"ompup: broker configured at {config.broker_url}" + ("; local config updated" if changed else ""))
-    elif args.auth_command == "migrate":
-        bootstrap_auth(hosts)
-        command = ["omp", "auth-broker", "migrate", "--from-local", "--include-oauth"]
-        if args.dry_run:
-            command.append("--dry-run")
-        run(command)
-        return
-    run(["omp", "auth-broker", "status", "--json"])
-
-
-def verify_selected_environment(choice: HostChoice, session: str):
-    config = load_environment_config()
-    status = ensure_environment(choice.host)
-    if config.mode == "preserve":
-        print(f"ompup: preserving remote OMP configuration on {choice.host.name} ({status.omp_version})")
-        return status
-    print(f"ompup: environment {status.fingerprint[:12]} verified on {choice.host.name}")
-    if choice.probe.session_exists:
-        actual = session_environment(session)
-        if actual != status.fingerprint:
-            die(
-                f"remote tmux session {session!r} was started with environment "
-                f"{actual[:12] if actual else 'unknown'}; quit it before attaching "
-                f"with environment {status.fingerprint[:12]}"
-            )
-    return status
-
-
-
-
-def main() -> None:
-    global LAUNCH, REMOTE
-    args = parse_args()
-    validate_local_requirements(args)
-    try:
-        if args.command == "hosts":
-            show_hosts(args.json)
-            return
-        if args.command == "env":
-            run_environment_command(args)
-            return
-        if args.command == "auth":
-            run_auth_command(args)
-            return
-        root = resolve_project(
-            getattr(args, "project", "") or "",
-            getattr(args, "pick", False),
-            init_missing=args.command in {"up", "shell", "sync", "handoff"},
-        )
-        project = root.name
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", project):
-            die(f"project name {project!r} is not safe for remote paths")
-        hosts = load_hosts(LEGACY_HOST)
-        if args.command == "pin":
-            host = find_host(hosts, args.host)
-            pin_host(root, host.name)
-            print(f"ompup: pinned {project} to {host.name}")
-            return
-        if args.command == "unpin":
-            unpin_host(root)
-            print(f"ompup: removed host pin for {project}")
-            return
-        if args.command == "doctor":
-            run_doctor(root, project, args)
-            return
-
-        choice, _, remote_dir, session, state_key = host_context(
-            root,
-            project,
-            args.host,
-            args.profile,
-            persist=args.command != "status",
-        )
-        profile = project_profile(root, args.profile)
-        identity, origin = project_identity(root)
-        selected_environment = None
-        if args.command in {"up", "handoff"}:
-            selected_environment = verify_selected_environment(choice, session)
-        if getattr(args, "cmux", False):
-            open_cmux(root, project, choice.host.name, args.command)
-            return
-        if args.command == "handoff":
-            if selected_environment is None:
-                die("remote environment was not verified")
-            handoff_session(
-                root,
-                project,
-                remote_dir,
-                session,
-                state_key,
-                identity,
-                origin,
-                choice,
-                args,
-                selected_environment.fingerprint,
-            )
-            return
-        if args.command == "status":
-            show_status(root, state_key, remote_dir, identity, session)
-            return
-        if args.command == "pull":
-            sync_down(root, project, state_key, remote_dir, identity)
-            return
-        if args.command == "sync":
-            sync_up(root, project, state_key, remote_dir, identity, origin)
-            return
-
-        if choice.probe.project_exists and choice.probe.session_exists:
-            print("ompup: existing tmux session found; attaching without changing its checkout")
-        else:
-            sync_up(root, project, state_key, remote_dir, identity, origin)
-        attach(
-            session,
-            remote_dir,
-            "" if args.command == "shell" else LAUNCH,
-            selected_environment.fingerprint if selected_environment else "",
-        )
-    except (HostSelectionError, RuntimeError) as error:
-        die(str(error))
-
-
-if __name__ == "__main__":
-    main()
+cd "\$HOME"
+dir=$(sq "$dir")
+[ -d "\$dir" ] && [ ! -L "\$dir" ] || { echo 'BLOCK:remote tree is missing or unsafe' >&2; exit 2; }
+while IFS= read -r -d '' path; do
+  rel=\${path#"\$dir"/}; [ "\$path" != "\$dir" ] || rel=.
+  case "/\$rel/" in */.git/*) continue ;; esac
+  [[ "\$rel" =~ [[:cntrl:]] ]] && { echo 'BLOCK:unsupported control-byte pathname in remote tree' >&2; exit 2; }
+  if [ ! -f "\$path" ] && [ ! -d "\$path" ] && [ ! -L "\$path" ]; then
+    echo 'BLOCK:unsupported special file in remote tree' >&2
+    exit 2
+  fi
+done < <(find "\$dir" -print0)
+EOF
+}
+require_remote_tree() {
+  local dir=$1 output
+  output=$(ssh_read "$(remote_validate_tree_script "$dir")" 2>&1) ||
+    die "${output:-remote tree validation failed}"
+}
+
+# Context-free, domain-separated SHA-1. GIT_DIR prevents ambient repository
+# object format/configuration from affecting the stable protocol address.
+hash_fields() {
+  local domain=$1; shift
+  { printf 'ompup-v2:%s\000' "$domain"; for field in "$@"; do printf '%s\000' "$field"; done; } |
+    env GIT_DIR=/dev/null git hash-object --stdin
+}
+
+# Discover a valid Git root, but never downgrade a broken worktree to non-Git.
+ROOT=
+IDENTITY_KIND=
+ORIGIN=
+LOCAL_INSPECT_ROOT=${RECOVERY_SOURCE:-$(pwd -P)}
+if discovered=$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" rev-parse --show-toplevel 2>/dev/null); then
+  discovered=$(cd "$discovered" && pwd -P)
+  [ "$discovered" = "$LOCAL_INSPECT_ROOT" ] || die "pull recovery must start from the surviving project root"
+  ROOT=${RECOVERY_ROOT:-$discovered}
+  IDENTITY_KIND=git
+  [ -z "$RECOVERY_KIND" ] || [ "$RECOVERY_KIND" = git ] || die "pull recovery identity kind mismatch"
+  origins=$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" remote get-url --all origin 2>/dev/null || true)
+  [ -n "$origins" ] || die "Git project requires exactly one remote.origin.url"
+  case "$origins" in *$'\n'*) die "Git project requires exactly one remote.origin.url" ;; esac
+  require_plain remote.origin.url "$origins"
+  ORIGIN=$origins
+else
+  ROOT=${RECOVERY_ROOT:-$LOCAL_INSPECT_ROOT}
+  IDENTITY_KIND=non-git
+  [ -z "$RECOVERY_KIND" ] || [ "$RECOVERY_KIND" = non-git ] || die "pull recovery identity kind mismatch"
+  probe=$LOCAL_INSPECT_ROOT
+  while :; do
+    if [ -e "$probe/.git" ] || [ -L "$probe/.git" ]; then
+      die "found .git at '$probe' but Git validation failed; refusing non-Git downgrade"
+    fi
+    [ "$probe" = / ] && break
+    probe=${probe%/*}; [ -n "$probe" ] || probe=/
+  done
+fi
+require_plain "project root" "$ROOT"
+
+if [ "$IDENTITY_KIND" = git ]; then
+  IDENTITY_HASH=$(hash_fields git-origin "$ORIGIN")
+  slug_source=${ORIGIN%/}; slug_source=${slug_source##*/}; slug_source=${slug_source%.git}
+else
+  IDENTITY_HASH=$(hash_fields non-git-path "$ROOT")
+  slug_source=${ROOT##*/}
+fi
+slug=$(printf '%s' "$slug_source" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-][^a-z0-9._-]*/-/g; s/^-*//; s/-*$//')
+[ -n "$slug" ] || slug=project
+ADDRESS="$slug--${IDENTITY_HASH%${IDENTITY_HASH#????????????}}"
+SESSION_SLUG=$(printf '%.32s' "$slug")
+SESSION="ompup-$SESSION_SLUG-${IDENTITY_HASH%${IDENTITY_HASH#????????????}}"
+TARGET_HASH=$(hash_fields target "$HOST" "$REMOTE_ROOT")
+REMOTE_DIR="$REMOTE_ROOT/$ADDRESS"
+REMOTE_CONTROL="$REMOTE_ROOT/.ompup-v2/$ADDRESS"
+REMOTE_LOCK="$REMOTE_ROOT/.ompup-v2/locks/$ADDRESS.lock"
+PROJECT_STATE="$STATE_BASE/targets/$TARGET_HASH/$ADDRESS"
+STATE_FILE="$PROJECT_STATE/state"
+BASELINES="$PROJECT_STATE/baselines"
+TRANSACTIONS="$PROJECT_STATE/transactions"
+LOCAL_LOCK="$STATE_BASE/locks/$TARGET_HASH--$ADDRESS.lock"
+
+# Reject control-byte pathnames and unsupported transferable types before any
+# mutation. Do not inspect protected .git subtrees.
+validate_tree() {
+  local base=$1 path rel
+  while IFS= read -r -d '' path; do
+    rel=${path#"$base"/}; [ "$path" != "$base" ] || rel=.
+    case "/$rel/" in */.git/*) continue ;; esac
+    contains_control "$rel" && die "unsupported control-byte pathname in local tree"
+    if [ ! -f "$path" ] && [ ! -d "$path" ] && [ ! -L "$path" ]; then
+      die "unsupported special file in local tree"
+    fi
+  done < <(find "$base" -print0)
+}
+validate_tree "$LOCAL_INSPECT_ROOT"
+
+FILTER_KINDS=()
+FILTER_RULES=()
+add_filter() { FILTER_KINDS+=("$1"); FILTER_RULES+=("$2"); }
+add_default_filters() {
+  add_filter exclude .git
+  add_filter include .ompupignore
+  add_filter include .env.example
+  add_filter include .env.sample
+  local rule
+  for rule in '.env' '.env.*' '*.pem' '*.key' '*.p12' '*.pfx' '.ssh/' '.aws/' '.gnupg/' '.netrc' '.npmrc' '.pypirc' '.git-credentials' '.docker/config.json' '.kube/' '.config/gh/hosts.yml' 'node_modules/' '.venv/' 'venv/' '__pycache__/' '.pytest_cache/' '.mypy_cache/' 'target/' 'dist/' 'build/' '.next/' '.turbo/' '.cache/' '.DS_Store'; do
+    add_filter exclude "$rule"
+  done
+}
+add_ignore_text() {
+  local text=$1 label=$2 rule
+  while IFS= read -r rule || [ -n "$rule" ]; do
+    contains_control "$rule" && die "$label contains an unsupported control byte"
+    [ -n "$rule" ] && add_filter exclude "$rule"
+  done <<< "$text"
+  return 0
+}
+add_extra_filters() {
+  if [ -n "${OMPUP_EXCLUDES:-}" ]; then
+    local extras=() old=$IFS rule
+    IFS=: read -r -a extras <<< "$OMPUP_EXCLUDES"
+    IFS=$old
+    for rule in "${extras[@]}"; do [ -n "$rule" ] && add_filter exclude "$rule"; done
+  fi
+}
+build_filters() {
+  FILTER_KINDS=(); FILTER_RULES=()
+  add_default_filters
+  local ignore_path="$LOCAL_INSPECT_ROOT/.ompupignore"
+  if [ -e "$ignore_path" ] || [ -L "$ignore_path" ]; then
+    [ -f "$ignore_path" ] && [ ! -L "$ignore_path" ] ||
+      die "local .ompupignore must be a regular non-symlink file"
+    local local_ignore
+    local_ignore=$(cat "$ignore_path") || die "cannot read local .ompupignore"
+    add_ignore_text "$local_ignore" ".ompupignore"
+  fi
+  add_extra_filters
+}
+build_filters
+
+FILTER_ARGS=()
+make_filter_args() {
+  FILTER_ARGS=()
+  local i=0
+  while [ "$i" -lt "${#FILTER_RULES[@]}" ]; do
+    if [ "${FILTER_KINDS[$i]}" = include ]; then FILTER_ARGS+=("--include=${FILTER_RULES[$i]}")
+    else FILTER_ARGS+=("--exclude=${FILTER_RULES[$i]}")
+    fi
+    i=$((i + 1))
+  done
+}
+make_filter_args
+filter_digest() {
+  { local i=0; while [ "$i" -lt "${#FILTER_RULES[@]}" ]; do printf '%s\t%s\n' "${FILTER_KINDS[$i]}" "${FILTER_RULES[$i]}"; i=$((i + 1)); done; } |
+    env GIT_DIR=/dev/null git hash-object --stdin
+}
+FILTER_DIGEST=$(filter_digest)
+print_policy() {
+  say "filter-policy: convenience denylist, not a secret scanner"
+  local i=0
+  while [ "$i" -lt "${#FILTER_RULES[@]}" ]; do say "filter: ${FILTER_KINDS[$i]} ${FILTER_RULES[$i]}"; i=$((i + 1)); done
+}
+
+# Git tuple is mode<TAB>branch-or--<TAB>oid-or-. Validation rejects index
+# state that cannot cross the immutable .git boundary.
+GIT_MODE=none GIT_BRANCH=- GIT_OID=-
+local_git_tuple() {
+  [ "$IDENTITY_KIND" = git ] || { GIT_MODE=none; GIT_BRANCH=-; GIT_OID=-; return; }
+  env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" diff --cached --quiet --ignore-submodules -- || die "local Git index has staged changes"
+  [ -z "$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" ls-files -u)" ] || die "local Git has unmerged entries"
+  sparse=$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" config --bool core.sparseCheckout 2>/dev/null || true)
+  [ "$sparse" != true ] || die "local Git sparse checkout is unsupported"
+  [ -z "$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" ls-files -s | sed -n '/^160000 /p')" ] || die "local Gitlinks/submodules are unsupported"
+  gd=$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" rev-parse --git-dir)
+  case "$gd" in /*) ;; *) gd="$LOCAL_INSPECT_ROOT/$gd" ;; esac
+  for op in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-apply rebase-merge; do [ ! -e "$gd/$op" ] || die "local Git operation in progress: $op"; done
+  if oid=$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" rev-parse --verify HEAD 2>/dev/null); then
+    GIT_OID=$oid
+    if branch=$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null); then GIT_MODE=branch; GIT_BRANCH=$branch
+    else GIT_MODE=detached; GIT_BRANCH=-; fi
+  else
+    branch=$(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null) || die "invalid unborn Git HEAD"
+    GIT_MODE=unborn; GIT_BRANCH=$branch; GIT_OID=-
+  fi
+}
+local_git_tuple
+require_local_path_git_match() {
+  local dir=$1 origin gd oid branch mode
+  if [ "$IDENTITY_KIND" = non-git ]; then
+    [ ! -e "$dir/.git" ] && [ ! -L "$dir/.git" ] || die "local candidate unexpectedly contains .git"
+    return 0
+  fi
+  [ -e "$dir/.git" ] || die "local candidate Git metadata is missing"
+  origin=$(env GIT_OPTIONAL_LOCKS=0 git -C "$dir" remote get-url --all origin 2>/dev/null || true)
+  [ "$origin" = "$ORIGIN" ] || die "local candidate Git origin differs"
+  env GIT_OPTIONAL_LOCKS=0 git -C "$dir" diff --cached --quiet --ignore-submodules -- || die "local candidate Git index has staged changes"
+  [ -z "$(env GIT_OPTIONAL_LOCKS=0 git -C "$dir" ls-files -u)" ] || die "local candidate Git has unmerged entries"
+  [ "$(env GIT_OPTIONAL_LOCKS=0 git -C "$dir" config --bool core.sparseCheckout 2>/dev/null || true)" != true ] ||
+    die "local candidate sparse checkout is unsupported"
+  [ -z "$(env GIT_OPTIONAL_LOCKS=0 git -C "$dir" ls-files -s | sed -n '/^160000 /p')" ] || die "local candidate Gitlink is unsupported"
+  gd=$(env GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse --git-dir); case "$gd" in /*) ;; *) gd="$dir/$gd" ;; esac
+  for op in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-apply rebase-merge; do
+    [ ! -e "$gd/$op" ] || die "local candidate Git operation in progress: $op"
+  done
+  if oid=$(env GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse --verify HEAD 2>/dev/null); then
+    if branch=$(env GIT_OPTIONAL_LOCKS=0 git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null); then mode=branch
+    else mode=detached; branch=-; fi
+  else
+    branch=$(env GIT_OPTIONAL_LOCKS=0 git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null) ||
+      die "invalid local candidate unborn Git HEAD"
+    mode=unborn; oid=-
+  fi
+  [ "$mode/$branch/$oid" = "$GIT_MODE/$GIT_BRANCH/$GIT_OID" ] || die "local candidate Git tuple changed"
+}
+
+require_live_local_git_tuple() {
+  require_local_path_git_match "$LOCAL_INSPECT_ROOT"
+}
+
+remote_git_tuple_script() {
+  local dir=$1
+  cat <<EOF
+set -eu
+cd "\$HOME"
+dir=$(sq "$dir")
+if [ $(sq "$IDENTITY_KIND") = non-git ]; then
+  [ ! -e "\$dir/.git" ] || { echo 'BLOCK:remote unexpectedly contains .git'; exit 2; }
+  printf 'none\t-\t-\n'; exit 0
+fi
+[ -e "\$dir/.git" ] || { echo 'BLOCK:remote Git metadata is missing'; exit 2; }
+origin=\$(GIT_OPTIONAL_LOCKS=0 git -C "\$dir" remote get-url --all origin 2>/dev/null || true)
+[ "\$origin" = $(sq "$ORIGIN") ] || { echo 'BLOCK:remote origin differs'; exit 2; }
+GIT_OPTIONAL_LOCKS=0 git -C "\$dir" diff --cached --quiet --ignore-submodules -- || { echo 'BLOCK:remote Git index has staged changes'; exit 2; }
+[ -z "\$(GIT_OPTIONAL_LOCKS=0 git -C "\$dir" ls-files -u)" ] || { echo 'BLOCK:remote Git has unmerged entries'; exit 2; }
+[ "\$(GIT_OPTIONAL_LOCKS=0 git -C "\$dir" config --bool core.sparseCheckout 2>/dev/null || true)" != true ] || { echo 'BLOCK:remote sparse checkout'; exit 2; }
+[ -z "\$(GIT_OPTIONAL_LOCKS=0 git -C "\$dir" ls-files -s | sed -n '/^160000 /p')" ] || { echo 'BLOCK:remote Gitlink'; exit 2; }
+gd=\$(GIT_OPTIONAL_LOCKS=0 git -C "\$dir" rev-parse --git-dir); case "\$gd" in /*) ;; *) gd="\$dir/\$gd";; esac
+for op in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-apply rebase-merge; do [ ! -e "\$gd/\$op" ] || { echo "BLOCK:remote Git operation \$op"; exit 2; }; done
+if oid=\$(GIT_OPTIONAL_LOCKS=0 git -C "\$dir" rev-parse --verify HEAD 2>/dev/null); then
+  if branch=\$(GIT_OPTIONAL_LOCKS=0 git -C "\$dir" symbolic-ref --quiet --short HEAD 2>/dev/null); then printf 'branch\t%s\t%s\n' "\$branch" "\$oid"; else printf 'detached\t-\t%s\n' "\$oid"; fi
+else
+  branch=\$(GIT_OPTIONAL_LOCKS=0 git -C "\$dir" symbolic-ref --quiet --short HEAD 2>/dev/null) || { echo 'BLOCK:invalid remote unborn HEAD'; exit 2; }
+  printf 'unborn\t%s\t-\n' "\$branch"
+fi
+EOF
+}
+REMOTE_GIT_MODE=- REMOTE_GIT_BRANCH=- REMOTE_GIT_OID=-
+read_remote_git_tuple() {
+  local tuple
+  tuple=$(ssh_read "$(remote_git_tuple_script "$REMOTE_DIR")") || die "${tuple:-remote Git validation failed}"
+  IFS=$'\t' read -r REMOTE_GIT_MODE REMOTE_GIT_BRANCH REMOTE_GIT_OID extra <<< "$tuple"
+  [ -z "${extra:-}" ] && [ -n "$REMOTE_GIT_MODE" ] || die "malformed remote Git tuple"
+}
+require_git_match() {
+  read_remote_git_tuple
+  [ "$REMOTE_GIT_MODE" = "$GIT_MODE" ] && [ "$REMOTE_GIT_BRANCH" = "$GIT_BRANCH" ] && [ "$REMOTE_GIT_OID" = "$GIT_OID" ] ||
+    die "remote Git tuple diverged (local $GIT_MODE/$GIT_BRANCH/$GIT_OID; remote $REMOTE_GIT_MODE/$REMOTE_GIT_BRANCH/$REMOTE_GIT_OID)"
+}
+
+# Strict state parser: no sourcing, duplicates, unknowns, or omissions.
+STATE_PRESENT=0 ST_OWNER= ST_EPOCH= ST_BASELINE_EPOCH= ST_FILTER_DIGEST= ST_ACK_DIGEST= ST_GIT_MODE= ST_GIT_BRANCH= ST_GIT_OID=
+require_remote_path_git_match() {
+  local path=$1 tuple mode branch oid extra
+  tuple=$(ssh_read "$(remote_git_tuple_script "$path")") || die "${tuple:-remote candidate Git validation failed}"
+  IFS=$'\t' read -r mode branch oid extra <<< "$tuple"
+  [ -z "${extra:-}" ] && [ "$mode" = "$GIT_MODE" ] && [ "$branch" = "$GIT_BRANCH" ] && [ "$oid" = "$GIT_OID" ] ||
+    die "remote candidate Git tuple does not match local"
+}
+validate_baseline_generation() {
+  local epoch=$1 generation
+  valid_epoch "$epoch" || die "invalid baseline epoch"
+  [ -d "$BASELINES" ] && [ ! -L "$BASELINES" ] || die "state baselines directory is missing or unsafe"
+  generation="$BASELINES/$epoch"
+  [ -d "$generation" ] && [ ! -L "$generation" ] &&
+    [ -d "$generation/tree" ] && [ ! -L "$generation/tree" ] &&
+    [ -f "$generation/rules" ] && [ ! -L "$generation/rules" ] ||
+    die "state baseline generation is missing or unsafe"
+}
+check_baseline_generation_removal() {
+  local epoch=$1 generation
+  valid_epoch "$epoch" || die "refusing invalid baseline generation deletion"
+  [ -e "$BASELINES" ] || return 0
+  [ -d "$BASELINES" ] && [ ! -L "$BASELINES" ] || die "refusing unsafe baselines directory deletion"
+  generation="$BASELINES/$epoch"
+  [ -e "$generation" ] || [ -L "$generation" ] || return 0
+  [ -d "$generation" ] && [ ! -L "$generation" ] || die "refusing symlink baseline generation deletion"
+}
+remove_baseline_generation() {
+  local epoch=$1 generation
+  check_baseline_generation_removal "$epoch"
+  generation="$BASELINES/$epoch"
+  [ -e "$generation" ] || return 0
+  rm -rf -- "$generation"
+}
+next_epoch() {
+  valid_epoch "$1" || die "invalid state epoch"
+  [ "$1" != 2147483647 ] || die "state epoch is exhausted"
+  printf '%s' $((1 + $1))
+}
+
+validate_existing_local_dir_chain() {
+  local path=$1 parent
+  if [ "$path" = "$STATE_ANCHOR" ]; then
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      [ -d "$path" ] && [ ! -L "$path" ] || die "managed local directory is unsafe: $path"
+    fi
+    return 0
+  fi
+  case "$path/" in "$STATE_ANCHOR/"*) ;; *) die "managed local path escapes the state root: $path" ;; esac
+  parent=${path%/*}; [ "$parent" != "$path" ] || die "invalid managed local path: $path"
+  validate_existing_local_dir_chain "$parent"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -d "$path" ] && [ ! -L "$path" ] || die "managed local directory is unsafe: $path"
+  fi
+}
+
+ensure_local_dir() {
+  local path=$1 parent
+  validate_existing_local_dir_chain "$path"
+  [ -d "$path" ] && return 0
+  if [ "$path" = "$STATE_ANCHOR" ]; then
+    mkdir -p "$path" || die "cannot create local state root: $path"
+  else
+    parent=${path%/*}; [ "$parent" != "$path" ] || die "invalid managed local path: $path"
+    ensure_local_dir "$parent"
+    if ! mkdir "$path" 2>/dev/null; then
+      [ -d "$path" ] && [ ! -L "$path" ] || die "cannot safely create managed local directory: $path"
+    fi
+  fi
+  [ -d "$path" ] && [ ! -L "$path" ] || die "cannot safely create managed local directory: $path"
+}
+
+require_local_dir() {
+  validate_existing_local_dir_chain "$1"
+  [ -d "$1" ] && [ ! -L "$1" ] || die "managed local directory is missing or unsafe: $1"
+}
+
+write_exclusive_file() {
+  local path=$1 text=$2
+  [ ! -e "$path" ] && [ ! -L "$path" ] || die "exclusive managed file already exists: $path"
+  (umask 077; set -C; printf '%s' "$text" > "$path") ||
+    die "cannot exclusively create managed file: $path"
+  [ -f "$path" ] && [ ! -L "$path" ] || die "managed file is not a regular file: $path"
+}
+
+safe_remove_local_dir() {
+  require_local_dir "$1"
+  rm -rf -- "$1"
+}
+
+read_state() {
+  STATE_PRESENT=0
+  [ ! -L "$STATE_FILE" ] || die "state file must not be a symlink"
+  [ -f "$STATE_FILE" ] || return 0
+  local seen='|' key value extra
+  while IFS=$'\t' read -r key value extra || [ -n "$key" ]; do
+    [ -n "$key" ] && [ -z "${extra:-}" ] || die "malformed state file"
+    case "$seen" in *"|$key|"*) die "duplicate state field: $key" ;; esac
+    seen="$seen$key|"
+    case "$key" in
+      schema) [ "$value" = 2 ] || die "unsupported state schema" ;;
+      identity_kind) [ "$value" = "$IDENTITY_KIND" ] || die "state identity kind mismatch" ;;
+      identity_hash) [ "$value" = "$IDENTITY_HASH" ] || die "state identity hash mismatch" ;;
+      address) [ "$value" = "$ADDRESS" ] || die "state address mismatch" ;;
+      local_root) [ "$value" = "$ROOT" ] || die "state belongs to a different local checkout" ;;
+      host) [ "$value" = "$HOST" ] || die "state host mismatch" ;;
+      remote_root) [ "$value" = "$REMOTE_ROOT" ] || die "state remote root mismatch" ;;
+      remote_dir) [ "$value" = "$REMOTE_DIR" ] || die "state remote directory mismatch" ;;
+      tmux_session) [ "$value" = "$SESSION" ] || die "state tmux session mismatch" ;;
+      epoch) ST_EPOCH=$value ;;
+      owner) ST_OWNER=$value ;;
+      baseline_epoch) ST_BASELINE_EPOCH=$value ;;
+      filter_digest) ST_FILTER_DIGEST=$value ;;
+      exclude_ack_digest) ST_ACK_DIGEST=$value ;;
+      git_mode) ST_GIT_MODE=$value ;;
+      git_branch) ST_GIT_BRANCH=$value ;;
+      git_oid) ST_GIT_OID=$value ;;
+      *) die "unknown state field: $key" ;;
+    esac
+  done < "$STATE_FILE"
+  for key in schema identity_kind identity_hash address local_root host remote_root remote_dir tmux_session epoch owner baseline_epoch filter_digest exclude_ack_digest git_mode git_branch git_oid; do
+    case "$seen" in *"|$key|"*) ;; *) die "missing state field: $key" ;; esac
+  done
+  valid_epoch "$ST_EPOCH" || die "invalid state epoch"
+  valid_epoch "$ST_BASELINE_EPOCH" || die "invalid state baseline epoch"
+  [ "$ST_BASELINE_EPOCH" = "$ST_EPOCH" ] || die "state baseline epoch mismatch"
+  [ "$ST_OWNER" = local ] || [ "$ST_OWNER" = remote ] || die "invalid state owner"
+  case "$ST_GIT_MODE" in none|branch|detached|unborn) ;; *) die "invalid state Git mode" ;; esac
+  require_plain "state Git branch" "$ST_GIT_BRANCH"; require_plain "state Git OID" "$ST_GIT_OID"
+  valid_sha1 "$ST_FILTER_DIGEST" || die "invalid state filter digest"
+  [ "$ST_ACK_DIGEST" = - ] || valid_sha1 "$ST_ACK_DIGEST" || die "invalid state acknowledgement digest"
+  validate_baseline_generation "$ST_BASELINE_EPOCH"
+  STATE_PRESENT=1
+}
+validate_existing_local_dir_chain "$PROJECT_STATE"
+read_state
+
+marker_text() {
+  printf 'schema\t2\nidentity_hash\t%s\nidentity_kind\t%s\naddress\t%s\ncreated_by_version\t%s\n' "$IDENTITY_HASH" "$IDENTITY_KIND" "$ADDRESS" "$VERSION"
+}
+MARKER_ERROR=
+validate_marker_text() {
+  local text=$1 seen='|' key value extra count=0
+  MARKER_ERROR=
+  while IFS=$'\t' read -r key value extra; do
+    if [ -z "$key" ] || [ -n "${extra:-}" ]; then MARKER_ERROR="malformed remote marker"; return 1; fi
+    case "$seen" in *"|$key|"*) MARKER_ERROR="duplicate remote marker field: $key"; return 1 ;; esac
+    seen="$seen$key|"; count=$((count + 1))
+    case "$key" in
+      schema) [ "$value" = 2 ] || { MARKER_ERROR="remote marker schema mismatch"; return 1; } ;;
+      identity_hash) [ "$value" = "$IDENTITY_HASH" ] || { MARKER_ERROR="remote marker identity mismatch"; return 1; } ;;
+      identity_kind) [ "$value" = "$IDENTITY_KIND" ] || { MARKER_ERROR="remote marker kind mismatch"; return 1; } ;;
+      address) [ "$value" = "$ADDRESS" ] || { MARKER_ERROR="remote marker address mismatch"; return 1; } ;;
+      created_by_version) [ "$value" = "$VERSION" ] || { MARKER_ERROR="remote marker version mismatch"; return 1; } ;;
+      *) MARKER_ERROR="unknown remote marker field: $key"; return 1 ;;
+    esac
+  done <<< "$text"
+  [ "$count" -eq 5 ] || { MARKER_ERROR="remote marker is incomplete"; return 1; }
+  return 0
+}
+require_marker() {
+  local text
+  text=$(ssh_read "set -eu; cd \"\$HOME\"; $(remote_safe_dir_prelude); require_dir $(sq "$REMOTE_CONTROL"); marker=$(sq "$REMOTE_CONTROL/marker"); [ -f \"\$marker\" ] && [ ! -L \"\$marker\" ]; cat \"\$marker\"") ||
+    die "remote marker is missing or unsafe; refusing destination adoption"
+  validate_marker_text "$text" || die "$MARKER_ERROR"
+}
+remote_destination_state() {
+  ssh_run "cd \"\$HOME\"; dir=$(sq "$REMOTE_DIR"); marker=$(sq "$REMOTE_CONTROL/marker"); if [ -e \"\$dir\" ] || [ -L \"\$dir\" ]; then [ -d \"\$dir\" ] && [ ! -L \"\$dir\" ] || exit 2; if [ -f \"\$marker\" ] && [ ! -L \"\$marker\" ]; then echo marked; else echo unmarked; fi; else echo absent; fi"
+}
+
+load_frozen_filters() {
+  FILTER_KINDS=(); FILTER_RULES=()
+  local kind rule extra
+  while IFS=$'\t' read -r kind rule extra || [ -n "$kind" ]; do
+    [ -z "${extra:-}" ] && { [ "$kind" = include ] || [ "$kind" = exclude ]; } || die "malformed baseline filter rules"
+    contains_control "$rule" && die "malformed baseline filter rule"
+    add_filter "$kind" "$rule"
+  done < "$BASELINES/$ST_BASELINE_EPOCH/rules"
+  [ "${FILTER_KINDS[0]:-}" = exclude ] && [ "${FILTER_RULES[0]:-}" = .git ] || die "baseline does not protect .git"
+  make_filter_args
+}
+RULES_TEXT=
+freeze_rules_text() {
+  [ -z "$RULES_TEXT" ] || return 0
+  local i=0 text=
+  while [ "$i" -lt "${#FILTER_RULES[@]}" ]; do
+    text="${text}${FILTER_KINDS[$i]}"$'\t'"${FILTER_RULES[$i]}"$'\n'
+    i=$((i + 1))
+  done
+  RULES_TEXT=$text
+}
+write_rules() {
+  local file=$1
+  freeze_rules_text
+  write_exclusive_file "$file" "$RULES_TEXT"
+}
+
+RSYNC_COMMON=(-rltpc --prune-empty-dirs)
+SSH_TRANSPORT='ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes'
+rsync_copy_local() {
+  local source=$1 destination=$2
+  [ -d "$destination" ] && [ ! -L "$destination" ] || die "local rsync destination is unsafe"
+  (cd "$destination" && rsync "${RSYNC_COMMON[@]}" --delete "${FILTER_ARGS[@]}" "$source/" ./)
+}
+rsync_local_to_remote_container() {
+  local source=$1 container=$2 nonce remote_command
+  nonce=$(container_nonce candidate "$container")
+  remote_command="cd $(sq "$container") && [ -d . ] && [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = $(sq "$nonce") ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ] && [ -d tree ] && [ ! -L tree ] && exec rsync"
+  rsync -e "$SSH_TRANSPORT" --rsync-path="$remote_command" "${RSYNC_COMMON[@]}" --delete \
+    "${FILTER_ARGS[@]}" "$source/" "$HOST:tree/"
+}
+rsync_remote_to_local() {
+  local source=$1 destination=$2
+  [ -d "$destination" ] && [ ! -L "$destination" ] || die "local rsync destination is unsafe"
+  (cd "$destination" && rsync -e "$SSH_TRANSPORT" "${RSYNC_COMMON[@]}" --delete "${FILTER_ARGS[@]}" "$HOST:$source/" ./)
+}
+compare_local() {
+  { rsync "${RSYNC_COMMON[@]}" -ni --out-format=$'%i\t%n' "${FILTER_ARGS[@]}" "$1/" "$2/"
+    rsync "${RSYNC_COMMON[@]}" -ni --out-format=$'%i\t%n' "${FILTER_ARGS[@]}" "$2/" "$1/"
+  } | sed -e $'/^\\.d\\.\\.t\\.\\.\\.\\.\\t/d' -e $'/^\\.d\\.\\.t\\.\\.\\.\\.\\.\\.\\t/d' | sort -u
+}
+compare_remote() {
+  { rsync -e "$SSH_TRANSPORT" "${RSYNC_COMMON[@]}" -ni --out-format=$'%i\t%n' "${FILTER_ARGS[@]}" "$1/" "$HOST:$2/"
+    rsync -e "$SSH_TRANSPORT" "${RSYNC_COMMON[@]}" -ni --out-format=$'%i\t%n' "${FILTER_ARGS[@]}" "$HOST:$2/" "$1/"
+  } | sed -e $'/^\\.d\\.\\.t\\.\\.\\.\\.\\t/d' -e $'/^\\.d\\.\\.t\\.\\.\\.\\.\\.\\.\\t/d' | sort -u
+}
+
+LOCAL_CHANGES= REMOTE_CHANGES=
+compute_changes() {
+  load_frozen_filters
+  validate_tree "$ROOT"
+  require_remote_tree "$REMOTE_DIR"
+  LOCAL_CHANGES=$(compare_local "$BASELINES/$ST_BASELINE_EPOCH/tree" "$ROOT" || die "failed to compare local tree")
+  REMOTE_CHANGES=$(compare_remote "$BASELINES/$ST_BASELINE_EPOCH/tree" "$REMOTE_DIR" || die "failed to compare remote tree")
+}
+require_effective_owner() {
+  local expected=$1
+  if [ -n "$LOCAL_CHANGES" ] && [ -n "$REMOTE_CHANGES" ]; then
+    print_change_set local-changed "$LOCAL_CHANGES"; print_change_set remote-changed "$REMOTE_CHANGES"
+    die "ownership is unknown-conflict; both sides changed"
+  fi
+  if [ "$ST_OWNER" = remote ] && [ -n "$LOCAL_CHANGES" ]; then
+    print_change_set local-changed "$LOCAL_CHANGES"
+    die "non-owning local side changed; ownership is unknown-conflict"
+  fi
+  if [ "$ST_OWNER" = local ] && [ -n "$REMOTE_CHANGES" ]; then
+    print_change_set remote-changed "$REMOTE_CHANGES"
+    die "non-owning remote side changed; ownership is unknown-conflict"
+  fi
+  [ "$ST_OWNER" = "$expected" ] || die "$ST_OWNER already owns the tree; explicit handoff from $expected is required"
+}
+print_change_set() {
+  local label=$1 data=$2 line prefix path rendered
+  if [ -z "$data" ]; then say "$label: (none)"; return; fi
+  say "$label:"
+  while IFS= read -r line; do
+    case "$line" in
+      *$'\t'*) prefix=${line%%$'\t'*}; path=${line#*$'\t'}; rendered=$(escape_path "$path"); say "  $prefix	$rendered" ;;
+      *) rendered=$(escape_path "$line"); say "  $rendered" ;;
+    esac
+  done <<< "$data"
+}
+common_changes() {
+  local a b ap bp out=
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue; ap=${a#*$'\t'}
+    while IFS= read -r b; do [ -n "$b" ] || continue; bp=${b#*$'\t'}; [ "$ap" = "$bp" ] && out="${out}${out:+$'\n'}$ap"; done <<< "$REMOTE_CHANGES"
+  done <<< "$LOCAL_CHANGES"
+  printf '%s' "$out"
+}
+
+# Determine tracked paths omitted by rsync's actual filter engine. The dry-run
+# destination is deliberately absent; rsync -n creates nothing.
+TRACKED_EXCLUDED= ACK_DIGEST=-
+compute_tracked_excluded() {
+  TRACKED_EXCLUDED=; ACK_DIGEST=-
+  [ "$IDENTITY_KIND" = git ] || return 0
+  local probe="${TMPDIR:-/tmp}/.ompup-filter-probe-$IDENTITY_HASH-$$" listing path included line
+  [ ! -e "$probe" ] || die "filter probe path unexpectedly exists: $probe"
+  listing=$(rsync -rltpcni --out-format='%n' "${FILTER_ARGS[@]}" "$LOCAL_INSPECT_ROOT/" "$probe/" || die "cannot inspect filter policy")
+  while IFS= read -r -d '' path; do
+    included=0
+    while IFS= read -r line; do
+      [ "$line" = "$path" ] && included=1
+    done <<< "$listing"
+    if [ "$included" -eq 0 ]; then TRACKED_EXCLUDED="${TRACKED_EXCLUDED}${TRACKED_EXCLUDED:+$'\n'}$path"; fi
+  done < <(env GIT_OPTIONAL_LOCKS=0 git -C "$LOCAL_INSPECT_ROOT" ls-files -z)
+  if [ -n "$TRACKED_EXCLUDED" ]; then
+    ACK_DIGEST=$({ printf '%s\n' "$FILTER_DIGEST"; printf '%s\n' "$TRACKED_EXCLUDED"; } | env GIT_DIR=/dev/null git hash-object --stdin)
+  fi
+}
+compute_tracked_excluded
+check_ack() {
+  [ -z "$TRACKED_EXCLUDED" ] && return 0
+  say "tracked-excluded:"
+  while IFS= read -r path; do say "  $(escape_path "$path")"; done <<< "$TRACKED_EXCLUDED"
+  if [ "$ST_ACK_DIGEST" = "$ACK_DIGEST" ]; then return 0; fi
+  [ "$ACKNOWLEDGE" -eq 1 ] || die "tracked files are excluded; review them and rerun with --acknowledge-excluded"
+  say "exclude-acknowledgement: $ACK_DIGEST"
+}
+
+TOKEN="$$-$(date +%s)"
+LOCKED_LOCAL=0 LOCKED_REMOTE=0 PUBLISHED=0 LOCAL_STAGE=
+LOCAL_CANDIDATE_CONTAINER= LOCAL_BACKUP_CONTAINER=
+REMOTE_CANDIDATE_CONTAINER= REMOTE_BACKUP_CONTAINER=
+container_nonce() { hash_fields transaction-container "$IDENTITY_HASH" "$1" "$2"; }
+require_local_container() {
+  local path=$1 kind=$2 expected
+  expected=$(container_nonce "$kind" "$path")
+  [ -d "$path" ] && [ ! -L "$path" ] &&
+    [ -f "$path/.ompup-nonce" ] && [ ! -L "$path/.ompup-nonce" ] &&
+    [ "$(cat "$path/.ompup-nonce")" = "$expected" ] ||
+    die "transaction $kind container is missing, replaced, or unsafe"
+}
+create_local_container() {
+  local kind=$1 parent=$2 path
+  [ -d "$parent" ] && [ ! -L "$parent" ] || die "transaction container parent is unsafe"
+  path=$(mktemp -d "$parent/.ompup-$kind-$ADDRESS-$TOKEN.XXXXXX") ||
+    die "cannot exclusively create local $kind container"
+  case "$path" in "$parent/.ompup-$kind-$ADDRESS-$TOKEN."??????) ;; *) die "mktemp returned an invalid local container path" ;; esac
+  [ -d "$path" ] && [ ! -L "$path" ] || die "new local $kind container is unsafe"
+  write_exclusive_file "$path/.ompup-nonce" "$(container_nonce "$kind" "$path")"$'\n'
+  CREATED_CONTAINER=$path
+}
+remove_local_container() {
+  local path=$1 kind=$2
+  [ -n "$path" ] || return 0
+  require_local_container "$path" "$kind"
+  (
+    cd "$path"
+    [ ! -L tree ] && [ ! -L failed ] || exit 2
+    [ ! -e tree ] || { [ -d tree ] && rm -rf -- tree; }
+    [ ! -e failed ] || { [ -d failed ] && rm -rf -- failed; }
+    rm -- .ompup-nonce
+  ) || die "cannot safely empty local $kind container"
+  rmdir "$path" || die "cannot safely remove local $kind container"
+}
+remove_remote_container() {
+  local path=$1 kind=$2 nonce parent base
+  [ -n "$path" ] || return 0
+  nonce=$(container_nonce "$kind" "$path"); parent=${path%/*}; base=${path##*/}
+  if ! ssh_run "set -eu; cd \"\$HOME\"; parent=$(sq "$parent"); base=$(sq "$base"); cd \"\$parent/\$base\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = $(sq "$nonce") ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ ! -L tree ] && [ ! -L failed ]; [ ! -e tree ] || { [ -d tree ]; rm -rf -- tree; }; [ ! -e failed ] || { [ -d failed ]; rm -rf -- failed; }; rm -- .ompup-nonce; cd ..; rmdir -- \"\$base\""; then
+    warn "cannot safely remove remote $kind container"
+    return 1
+  fi
+}
+cleanup() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  if [ "$PUBLISHED" -eq 0 ]; then
+    if [ -n "$LOCAL_STAGE" ] && [ -d "$LOCAL_STAGE" ] && [ ! -L "$LOCAL_STAGE" ]; then
+      safe_remove_local_dir "$LOCAL_STAGE"
+    fi
+    [ -z "$LOCAL_CANDIDATE_CONTAINER" ] || remove_local_container "$LOCAL_CANDIDATE_CONTAINER" candidate
+    [ -z "$LOCAL_BACKUP_CONTAINER" ] || remove_local_container "$LOCAL_BACKUP_CONTAINER" backup
+    [ -z "$REMOTE_CANDIDATE_CONTAINER" ] || remove_remote_container "$REMOTE_CANDIDATE_CONTAINER" candidate
+    [ -z "$REMOTE_BACKUP_CONTAINER" ] || remove_remote_container "$REMOTE_BACKUP_CONTAINER" backup
+  fi
+  if [ "$LOCKED_REMOTE" -eq 1 ]; then
+    ssh_run "cd \"\$HOME\"; [ \"\$(cat $(sq "$REMOTE_LOCK/token") 2>/dev/null || true)\" != $(sq "$TOKEN") ] || rm -rf $(sq "$REMOTE_LOCK")" >/dev/null 2>&1 || true
+  fi
+  if [ "$LOCKED_LOCAL" -eq 1 ] && [ "$(cat "$LOCAL_LOCK/token" 2>/dev/null || true)" = "$TOKEN" ]; then rm -rf "$LOCAL_LOCK"; fi
+  exit "$rc"
+}
+release_locks() {
+  if [ "$LOCKED_REMOTE" -eq 1 ]; then
+    if ssh_run "cd \"\$HOME\"; [ \"\$(cat $(sq "$REMOTE_LOCK/token") 2>/dev/null || true)\" != $(sq "$TOKEN") ] || rm -rf $(sq "$REMOTE_LOCK")"; then
+      LOCKED_REMOTE=0
+    else
+      warn "could not release remote lock; cleanup will retry"
+    fi
+  fi
+  if [ "$LOCKED_LOCAL" -eq 1 ] && [ "$(cat "$LOCAL_LOCK/token" 2>/dev/null || true)" = "$TOKEN" ]; then
+    rm -rf "$LOCAL_LOCK"
+    LOCKED_LOCAL=0
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
+acquire_locks() {
+  umask 077
+  ensure_local_dir "${LOCAL_LOCK%/*}"
+  if ! mkdir "$LOCAL_LOCK" 2>/dev/null; then
+    oldpid=$(cat "$LOCAL_LOCK/pid" 2>/dev/null || true)
+    case "$oldpid" in
+      ''|*[!0-9]*) die "local mutation lock is held or malformed: $LOCAL_LOCK" ;;
+      *) die "local mutation lock is held by PID $oldpid; stale locks require explicit inspection and removal" ;;
+    esac
+  fi
+  [ -d "$LOCAL_LOCK" ] && [ ! -L "$LOCAL_LOCK" ] || die "local mutation lock is unsafe"
+  write_exclusive_file "$LOCAL_LOCK/pid" "$$"$'\n'
+  write_exclusive_file "$LOCAL_LOCK/token" "$TOKEN"$'\n'
+  LOCKED_LOCAL=1
+  script="set -eu; cd \"\$HOME\"; umask 077; $(remote_safe_dir_prelude); safe_dir $(sq "$REMOTE_ROOT"); safe_dir $(sq "$REMOTE_ROOT/.ompup-v2"); safe_dir $(sq "$REMOTE_ROOT/.ompup-v2/locks"); lock=$(sq "$REMOTE_LOCK"); mkdir \"\$lock\" || { echo 'remote mutation lock is held' >&2; exit 3; }; [ -d \"\$lock\" ] && [ ! -L \"\$lock\" ]; set -C; printf '%s\\n' $(sq "$TOKEN") > \"\$lock/token\"; [ -f \"\$lock/token\" ] && [ ! -L \"\$lock/token\" ]"
+  ssh_run "$script" || die "cannot acquire remote mutation lock"
+  LOCKED_REMOTE=1
+}
+
+write_state() {
+  local owner=$1 epoch=$2 baseline_epoch=$3 ack=$4
+  local tmp_dir="$PROJECT_STATE/.state-tmp-$TOKEN" tmp="$PROJECT_STATE/.state-tmp-$TOKEN/state" text
+  ensure_local_dir "$PROJECT_STATE"
+  [ ! -e "$tmp_dir" ] && [ ! -L "$tmp_dir" ] || die "local state temp directory already exists"
+  mkdir "$tmp_dir" || die "cannot exclusively create local state temp directory"
+  [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ] || die "local state temp directory is unsafe"
+  text=$(cat <<EOF
+schema	2
+identity_kind	$IDENTITY_KIND
+identity_hash	$IDENTITY_HASH
+address	$ADDRESS
+local_root	$ROOT
+host	$HOST
+remote_root	$REMOTE_ROOT
+remote_dir	$REMOTE_DIR
+tmux_session	$SESSION
+epoch	$epoch
+owner	$owner
+baseline_epoch	$baseline_epoch
+filter_digest	$FILTER_DIGEST
+exclude_ack_digest	$ack
+git_mode	$GIT_MODE
+git_branch	$GIT_BRANCH
+git_oid	$GIT_OID
+EOF
+)
+  write_exclusive_file "$tmp" "$text"$'\n'
+  [ ! -L "$STATE_FILE" ] || die "state file became a symlink"
+  [ ! -e "$STATE_FILE" ] || [ -f "$STATE_FILE" ] || die "state path is not a regular file"
+  mv "$tmp" "$STATE_FILE"
+  rmdir "$tmp_dir"
+}
+
+remote_remove_transaction_artifacts() {
+  local txn_token=$1 script removals artifact
+  shift
+  script="set -eu; cd \"\$HOME\"; $(remote_control_dirs_script); safe_dir $(sq "$REMOTE_CONTROL/txn"); txn=$(sq "$REMOTE_CONTROL/txn/$txn_token"); if [ -e \"\$txn\" ] || [ -L \"\$txn\" ]; then [ -d \"\$txn\" ] && [ ! -L \"\$txn\" ]; fi"
+  removals=$(sq "$REMOTE_CONTROL/txn/$txn_token")
+  for artifact in "$@"; do
+    script="$script; artifact=$(sq "$artifact"); { [ ! -e \"\$artifact\" ] && [ ! -L \"\$artifact\" ]; } || { [ -d \"\$artifact\" ] && [ ! -L \"\$artifact\" ]; }"
+    removals="$removals $(sq "$artifact")"
+  done
+  ssh_run "$script; rm -rf $removals"
+}
+
+# Recover the one durable local journal before starting another mutation.
+# Random container paths are journal-bound; any nonce or content mismatch is
+# preserved and blocks instead of being adopted or recursively removed.
+recover_transaction() {
+  local journal= count=0 path key value extra txn_token= txn_dir= seen='|'
+  local schema= token= op= pre= target= pre_owner= target_owner= state=
+  local candidate_container= backup_container= candidate_tree backup_tree parent
+  [ -e "$TRANSACTIONS" ] || return 0
+  [ -d "$TRANSACTIONS" ] && [ ! -L "$TRANSACTIONS" ] || die "transactions directory is unsafe"
+  for path in "$TRANSACTIONS"/*/journal; do
+    [ -f "$path" ] && [ ! -L "$path" ] || continue
+    journal=$path; count=$((count + 1))
+  done
+  [ "$count" -le 1 ] || die "multiple unresolved local transaction journals"
+  [ "$count" -eq 1 ] || return 0
+  txn_dir=${journal%/journal}; txn_token=${txn_dir##*/}
+  [ -d "$txn_dir" ] && [ ! -L "$txn_dir" ] || die "transaction directory is unsafe"
+  [[ "$txn_token" =~ ^[0-9]+-[0-9]+$ ]] || die "invalid transaction directory token"
+  while IFS=$'\t' read -r key value extra || [ -n "$key" ]; do
+    [ -n "$key" ] && [ -z "${extra:-}" ] || die "malformed transaction journal"
+    case "$seen" in *"|$key|"*) die "duplicate transaction journal field: $key" ;; esac
+    seen="$seen$key|"
+    case "$key" in
+      schema) schema=$value ;; token) token=$value ;; operation) op=$value ;;
+      pre_epoch) pre=$value ;; target_epoch) target=$value ;;
+      pre_owner) pre_owner=$value ;; target_owner) target_owner=$value ;;
+      candidate_container) candidate_container=$value ;; backup_container) backup_container=$value ;;
+      *) die "unknown transaction journal field: $key" ;;
+    esac
+  done < "$journal"
+  for key in schema token operation pre_epoch target_epoch pre_owner target_owner candidate_container backup_container; do
+    case "$seen" in *"|$key|"*) ;; *) die "missing transaction journal field: $key" ;; esac
+  done
+  [ "$schema" = 2 ] || die "unsupported transaction journal schema"
+  [ "$token" = "$txn_token" ] || die "transaction journal token does not match its directory"
+  [ "$op" = sync ] || [ "$op" = pull ] || die "invalid transaction operation"
+  valid_epoch "$target" || die "invalid transaction target epoch"
+  if [ "$pre" = none ]; then
+    [ "$op" = sync ] && [ "$pre_owner" = none ] && [ "$target_owner" = remote ] ||
+      die "invalid initial transaction journal"
+  else
+    valid_epoch "$pre" || die "invalid transaction pre epoch"
+    [ "$target" -gt "$pre" ] || die "transaction epochs are not monotonic"
+    { [ "$pre_owner" = local ] || [ "$pre_owner" = remote ]; } || die "invalid transaction pre owner"
+    if [ "$op" = pull ]; then [ "$target_owner" = local ] || die "invalid pull transaction target owner"
+    else [ "$target_owner" = remote ] || die "invalid sync transaction target owner"; fi
+  fi
+  contains_control "$candidate_container$backup_container" && die "transaction journal contains a control-byte path"
+  parent=${ROOT%/*}; [ -n "$parent" ] || parent=/
+  if [ "$op" = pull ]; then
+    case "$candidate_container" in "$parent/.ompup-candidate-$ADDRESS-$txn_token."??????) ;; *) die "invalid local candidate container path" ;; esac
+    case "$backup_container" in "$parent/.ompup-backup-$ADDRESS-$txn_token."??????) ;; *) die "invalid local backup container path" ;; esac
+  else
+    case "$candidate_container" in "$REMOTE_ROOT/.ompup-candidate-$ADDRESS-$txn_token."??????) ;; *) die "invalid remote candidate container path" ;; esac
+    case "$backup_container" in "$REMOTE_ROOT/.ompup-backup-$ADDRESS-$txn_token."??????) ;; *) die "invalid remote backup container path" ;; esac
+  fi
+  candidate_tree="$candidate_container/tree"; backup_tree="$backup_container/tree"
+  check_baseline_generation_removal "$target"
+  [ -f "$txn_dir/rules" ] && [ ! -L "$txn_dir/rules" ] || die "transaction rules are missing or unsafe"
+  [ -d "$txn_dir/after" ] && [ ! -L "$txn_dir/after" ] || die "transaction target snapshot is missing or unsafe"
+  [ "$pre" = none ] || { [ -d "$txn_dir/before" ] && [ ! -L "$txn_dir/before" ]; } ||
+    die "transaction pre snapshot is missing or unsafe"
+
+  FILTER_KINDS=(); FILTER_RULES=(); RULES_TEXT=
+  while IFS=$'\t' read -r key value extra || [ -n "$key" ]; do
+    [ -z "${extra:-}" ] && { [ "$key" = include ] || [ "$key" = exclude ]; } || die "malformed transaction rules"
+    contains_control "$value" && die "malformed transaction rule"
+    add_filter "$key" "$value"
+  done < "$txn_dir/rules"
+  [ "${FILTER_KINDS[0]:-}" = exclude ] && [ "${FILTER_RULES[0]:-}" = .git ] ||
+    die "transaction rules do not protect .git"
+  make_filter_args
+  if [ "$op" = sync ]; then
+    validate_remote_journal_if_present "$txn_token" "$op" "$pre" "$target" "$pre_owner" "$target_owner" \
+      "$candidate_container" "$backup_container"
+  fi
+
+  if [ "$STATE_PRESENT" -eq 1 ] && [ "$ST_EPOCH" = "$target" ]; then
+    validate_baseline_generation "$target"
+    if [ "$op" = pull ]; then
+      validate_tree "$ROOT"
+      [ -z "$(compare_local "$BASELINES/$target/tree" "$ROOT")" ] ||
+        die "committed local target changed; preserving recovery artifacts"
+      if [ -e "$backup_container" ] || [ -L "$backup_container" ]; then remove_local_container "$backup_container" backup; fi
+      if [ -e "$candidate_container" ] || [ -L "$candidate_container" ]; then remove_local_container "$candidate_container" candidate; fi
+    else
+      require_remote_tree "$REMOTE_DIR"
+      [ -z "$(compare_remote "$BASELINES/$target/tree" "$REMOTE_DIR")" ] ||
+        die "committed remote target changed; preserving recovery artifacts"
+      if ssh_run "cd \"\$HOME\"; [ -e $(sq "$backup_container") ] || [ -L $(sq "$backup_container") ]" >/dev/null 2>&1; then
+        remove_remote_container "$backup_container" backup
+      fi
+      if ssh_run "cd \"\$HOME\"; [ -e $(sq "$candidate_container") ] || [ -L $(sq "$candidate_container") ]" >/dev/null 2>&1; then
+        remove_remote_container "$candidate_container" candidate
+      fi
+      remote_remove_transaction_artifacts "$txn_token"
+    fi
+    [ "$pre" = none ] || remove_baseline_generation "$pre"
+    safe_remove_local_dir "$txn_dir"
+    LOCAL_INSPECT_ROOT=$ROOT
+    say "ompup: finalized committed transaction $txn_token"
+    return 0
+  fi
+
+  if [ "$op" = pull ]; then
+    require_local_container "$backup_container" backup
+    if [ ! -e "$backup_tree" ] && [ ! -L "$backup_tree" ]; then
+      [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || die "unpublished pull live root is unsafe"
+      validate_tree "$ROOT"
+      [ -z "$(compare_local "$txn_dir/before" "$ROOT")" ] ||
+        die "unpublished pull destination changed; preserving transaction artifacts"
+      remove_local_container "$backup_container" backup
+      remove_local_container "$candidate_container" candidate
+    else
+      [ -d "$backup_tree" ] && [ ! -L "$backup_tree" ] || die "pull recovery backup tree is unsafe"
+      validate_tree "$backup_tree"
+      backup_changed=0
+      (require_local_path_git_match "$backup_tree") || backup_changed=1
+      [ -z "$(compare_local "$txn_dir/before" "$backup_tree")" ] || backup_changed=1
+      if [ "$backup_changed" -eq 1 ]; then
+        if [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ]; then
+          (cd "$backup_container" && move_exact tree "$ROOT" && [ ! -e tree ] && [ -d "$ROOT" ] && [ ! -L "$ROOT" ]) ||
+            die "pull recovery could not restore moved third version; artifacts preserved"
+          LOCAL_INSPECT_ROOT=$ROOT
+          cd "$ROOT"
+          die "pull recovery restored a moved third local version; transaction artifacts preserved"
+        fi
+        die "pull recovery found an occupied live path and moved third backup; preserved both versions"
+      fi
+      if [ -e "$ROOT" ] || [ -L "$ROOT" ]; then
+        [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || die "pull recovery live root is unsafe"
+        validate_tree "$ROOT"
+        [ -z "$(compare_local "$txn_dir/after" "$ROOT")" ] ||
+          die "pull recovery found a third local version; preserving both versions and transaction artifacts"
+        require_local_container "$candidate_container" candidate
+        [ ! -e "$candidate_container/failed" ] && [ ! -L "$candidate_container/failed" ] ||
+          die "pull recovery failed-tree slot is occupied"
+        (cd "$candidate_container" && move_exact "$ROOT" failed && [ -d failed ] && [ ! -L failed ] && [ ! -e "$ROOT" ]) ||
+          die "pull recovery could not preserve the transaction target; artifacts preserved"
+        validate_tree "$candidate_container/failed"
+        moved_changed=0
+        (require_local_path_git_match "$candidate_container/failed") || moved_changed=1
+        [ -z "$(compare_local "$txn_dir/after" "$candidate_container/failed")" ] || moved_changed=1
+        if [ "$moved_changed" -eq 1 ]; then
+          if [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ]; then
+            (cd "$candidate_container" && move_exact failed "$ROOT" && [ ! -e failed ] && [ -d "$ROOT" ] && [ ! -L "$ROOT" ]) ||
+              die "pull recovery could not restore moved recovery-race version; artifacts preserved"
+            LOCAL_INSPECT_ROOT=$ROOT
+            cd "$ROOT"
+            die "pull recovery restored a version changed during recovery move; transaction artifacts preserved"
+          fi
+          die "pull recovery move raced with an occupied live path; preserved both versions and transaction artifacts"
+        fi
+      fi
+      [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ] || die "pull recovery live path became occupied"
+      (cd "$backup_container" && move_exact tree "$ROOT" && [ ! -e tree ] && [ -d "$ROOT" ] && [ ! -L "$ROOT" ]) ||
+        die "pull recovery backup restore failed; artifacts preserved"
+      LOCAL_INSPECT_ROOT=$ROOT
+      require_local_path_git_match "$ROOT"
+      [ -z "$(compare_local "$txn_dir/before" "$ROOT")" ] || die "pull rollback validation failed; artifacts preserved"
+      cd "$ROOT"
+      remove_local_container "$backup_container" backup
+      remove_local_container "$candidate_container" candidate
+    fi
+  else
+    nonce=$(container_nonce backup "$backup_container")
+    backup_state=$(ssh_read "set -eu; cd \"\$HOME\"; container=$(sq "$backup_container"); [ -d \"\$container\" ] && [ ! -L \"\$container\" ]; [ \"\$(cat \"\$container/.ompup-nonce\" 2>/dev/null || true)\" = $(sq "$nonce") ]; if [ -e \"\$container/tree\" ] || [ -L \"\$container/tree\" ]; then [ -d \"\$container/tree\" ] && [ ! -L \"\$container/tree\" ]; echo tree; else echo empty; fi") ||
+      die "sync recovery backup container is missing, replaced, or unsafe"
+    state=$(remote_destination_state) || die "cannot inspect sync recovery destination"
+    if [ "$pre" != none ] && [ "$backup_state" = tree ]; then
+      require_remote_tree "$backup_tree"
+      backup_changed=0
+      (require_remote_path_git_match "$backup_tree") || backup_changed=1
+      [ -z "$(compare_remote "$txn_dir/before" "$backup_tree")" ] || backup_changed=1
+      if [ "$backup_changed" -eq 1 ]; then
+        if [ "$state" = absent ] && remote_restore_backup_if_live_absent "$backup_container"; then
+          die "sync recovery restored a moved third backup version; transaction artifacts preserved"
+        fi
+        die "sync recovery found an occupied live path and moved third backup; preserved both versions"
+      fi
+    fi
+    if [ "$pre" = none ]; then
+      if [ "$state" != absent ]; then
+        require_remote_tree "$REMOTE_DIR"
+        [ -z "$(compare_remote "$txn_dir/after" "$REMOTE_DIR")" ] ||
+          die "initial-sync recovery found a third remote version; preserving live tree and transaction artifacts"
+        bnonce=$(container_nonce backup "$backup_container")
+        ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; container=$(sq "$backup_container"); nonce=$(sq "$bnonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce)\" = \"\$nonce\" ]; [ ! -e tree ] && [ ! -L tree ]; [ -d \"\$live\" ] && [ ! -L \"\$live\" ]; move_exact \"\$live\" tree; [ -d tree ] && [ ! -L tree ] && [ ! -e \"\$live\" ]" ||
+          die "initial-sync recovery could not preserve transaction target"
+        require_remote_tree "$backup_tree"
+        moved_changed=0
+        (require_remote_path_git_match "$backup_tree") || moved_changed=1
+        [ -z "$(compare_remote "$txn_dir/after" "$backup_tree")" ] || moved_changed=1
+        if [ "$moved_changed" -eq 1 ]; then
+          live_state=$(remote_destination_state) || die "cannot inspect initial-sync recovery live path"
+          if [ "$live_state" = absent ] && remote_restore_backup_if_live_absent "$backup_container"; then
+            die "initial-sync recovery restored a version changed during recovery move; transaction artifacts preserved"
+          fi
+          die "initial-sync recovery move raced with an occupied live path; preserved both versions and transaction artifacts"
+        fi
+      fi
+      ssh_run "set -eu; cd \"\$HOME\"; marker=$(sq "$REMOTE_CONTROL/marker"); if [ -e \"\$marker\" ] || [ -L \"\$marker\" ]; then [ -f \"\$marker\" ] && [ ! -L \"\$marker\" ]; rm -- \"\$marker\"; fi"
+    else
+      if [ "$backup_state" = empty ]; then
+        require_remote_tree "$REMOTE_DIR"
+        [ -z "$(compare_remote "$txn_dir/before" "$REMOTE_DIR")" ] ||
+          die "unpublished sync destination changed; preserving transaction artifacts"
+      else
+        if [ "$state" != absent ]; then
+          require_remote_tree "$REMOTE_DIR"
+          [ -z "$(compare_remote "$txn_dir/after" "$REMOTE_DIR")" ] ||
+            die "sync recovery found a third remote version; preserving both versions and transaction artifacts"
+          cnonce=$(container_nonce candidate "$candidate_container")
+          ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; container=$(sq "$candidate_container"); nonce=$(sq "$cnonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce)\" = \"\$nonce\" ]; [ ! -e failed ] && [ ! -L failed ]; move_exact \"\$live\" failed; [ -d failed ] && [ ! -L failed ] && [ ! -e \"\$live\" ]" ||
+            die "sync recovery could not preserve transaction target"
+          require_remote_tree "$candidate_container/failed"
+          moved_changed=0
+          (require_remote_path_git_match "$candidate_container/failed") || moved_changed=1
+          [ -z "$(compare_remote "$txn_dir/after" "$candidate_container/failed")" ] || moved_changed=1
+          if [ "$moved_changed" -eq 1 ]; then
+            live_state=$(remote_destination_state) || die "cannot inspect sync recovery live path"
+            if [ "$live_state" = absent ] && remote_restore_failed_if_live_absent "$candidate_container"; then
+              die "sync recovery restored a version changed during recovery move; transaction artifacts preserved"
+            fi
+            die "sync recovery move raced with an occupied live path; preserved both versions and transaction artifacts"
+          fi
+        fi
+        remote_restore_backup_if_live_absent "$backup_container" ||
+          die "sync recovery backup restore failed; artifacts preserved"
+        require_remote_tree "$REMOTE_DIR"
+        [ -z "$(compare_remote "$txn_dir/before" "$REMOTE_DIR")" ] || die "sync rollback validation failed; artifacts preserved"
+    fi
+    fi
+    remove_remote_container "$backup_container" backup
+    remove_remote_container "$candidate_container" candidate
+    remote_remove_transaction_artifacts "$txn_token"
+  fi
+  remove_baseline_generation "$target"
+  safe_remove_local_dir "$txn_dir"
+  PUBLISHED=0
+  LOCAL_STAGE=
+  LOCAL_INSPECT_ROOT=$ROOT
+  build_filters; make_filter_args; FILTER_DIGEST=$(filter_digest)
+  say "ompup: recovered uncommitted transaction $txn_token to its pre-tree"
+}
+
+create_local_txn_dirs() {
+  ensure_local_dir "$TRANSACTIONS"
+  LOCAL_STAGE="$TRANSACTIONS/$TOKEN"
+  [ ! -e "$LOCAL_STAGE" ] && [ ! -L "$LOCAL_STAGE" ] || die "local transaction token directory already exists"
+  mkdir "$LOCAL_STAGE" || die "cannot exclusively create local transaction directory"
+  [ -d "$LOCAL_STAGE" ] && [ ! -L "$LOCAL_STAGE" ] || die "local transaction directory is unsafe"
+  mkdir "$LOCAL_STAGE/after" "$LOCAL_STAGE/before"
+}
+
+write_local_journal_temp() {
+  local operation=$1 epoch=$2 candidate_container=$3 backup_container=$4 text
+  text=$(journal_text "$TOKEN" "$operation" "${ST_EPOCH:-none}" "$epoch" "${ST_OWNER:-none}" \
+    "$([ "$operation" = pull ] && printf local || printf remote)" "$candidate_container" "$backup_container")
+  write_exclusive_file "$LOCAL_STAGE/journal.tmp" "$text"$'\n'
+}
+
+prepare_local_txn() {
+  local epoch=$1
+  RULES_TEXT=
+  create_local_txn_dirs
+  write_rules "$LOCAL_STAGE/rules"
+  rsync_copy_local "$ROOT" "$LOCAL_STAGE/after"
+  [ -z "$(compare_local "$LOCAL_STAGE/after" "$ROOT")" ] || die "local source changed while staging"
+  if [ "$STATE_PRESENT" -eq 1 ]; then rsync_copy_local "$BASELINES/$ST_BASELINE_EPOCH/tree" "$LOCAL_STAGE/before"; fi
+}
+publish_local_journal() {
+  [ -f "$LOCAL_STAGE/journal.tmp" ] && [ ! -L "$LOCAL_STAGE/journal.tmp" ] ||
+    die "local transaction journal temp is unsafe"
+  [ ! -e "$LOCAL_STAGE/journal" ] && [ ! -L "$LOCAL_STAGE/journal" ] ||
+    die "local transaction journal already exists"
+  mv "$LOCAL_STAGE/journal.tmp" "$LOCAL_STAGE/journal"
+  [ -f "$LOCAL_STAGE/journal" ] && [ ! -L "$LOCAL_STAGE/journal" ] ||
+    die "published local transaction journal is unsafe"
+  PUBLISHED=1
+}
+materialize_baseline() {
+  local epoch=$1 source=$2
+  ensure_local_dir "$BASELINES"
+  [ ! -e "$BASELINES/$epoch" ] && [ ! -L "$BASELINES/$epoch" ] ||
+    die "baseline generation already exists"
+  mkdir "$BASELINES/$epoch"
+  mkdir "$BASELINES/$epoch/tree"
+  rsync_copy_local "$source" "$BASELINES/$epoch/tree"
+  freeze_rules_text
+  write_exclusive_file "$BASELINES/$epoch/rules" "$RULES_TEXT"
+  [ -z "$(compare_local "$source" "$BASELINES/$epoch/tree")" ] || die "baseline materialization validation failed"
+}
+
+# Candidate containers are random, exclusively created directories. Every
+# write is anchored below a verified nonce-bearing container.
+remote_create_container() {
+  local kind=$1 path nonce
+  path=$(ssh_read "set -eu; cd \"\$HOME\"; umask 077; $(remote_safe_dir_prelude); require_dir $(sq "$REMOTE_ROOT"); path=\$(mktemp -d $(sq "$REMOTE_ROOT/.ompup-$kind-$ADDRESS-$TOKEN.XXXXXX")); [ -d \"\$path\" ] && [ ! -L \"\$path\" ]; printf '%s' \"\$path\"") ||
+    die "cannot exclusively create remote $kind container"
+  contains_control "$path" && die "remote mktemp returned a control-byte path"
+  case "$path" in "$REMOTE_ROOT/.ompup-$kind-$ADDRESS-$TOKEN."??????) ;; *) die "remote mktemp returned an invalid $kind container path" ;; esac
+  nonce=$(container_nonce "$kind" "$path")
+  ssh_write "set -eu; cd \"\$HOME\"; path=$(sq "$path"); [ -d \"\$path\" ] && [ ! -L \"\$path\" ]; [ ! -e \"\$path/.ompup-nonce\" ] && [ ! -L \"\$path/.ompup-nonce\" ]; umask 077; set -C; cat > \"\$path/.ompup-nonce\"; [ -f \"\$path/.ompup-nonce\" ] && [ ! -L \"\$path/.ompup-nonce\" ]" "$nonce"$'\n' ||
+    die "cannot bind remote $kind container nonce"
+  CREATED_REMOTE_CONTAINER=$path
+}
+remote_make_candidate() {
+  local initialized=$1 container=$2 nonce script
+  nonce=$(container_nonce candidate "$container")
+  script="set -eu; cd \"\$HOME\"; container=$(sq "$container"); nonce=$(sq "$nonce"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ ! -e tree ] && [ ! -L tree ]"
+  if [ "$initialized" -eq 0 ]; then
+    if [ "$IDENTITY_KIND" = git ]; then
+      script="$script; git clone --no-checkout --origin origin -- $(sq "$ORIGIN") tree"
+      if [ "$GIT_MODE" = branch ]; then script="$script; git -C tree cat-file -e $(sq "$GIT_OID^{commit}"); git -C tree checkout -B $(sq "$GIT_BRANCH") $(sq "$GIT_OID")"
+      elif [ "$GIT_MODE" = detached ]; then script="$script; git -C tree cat-file -e $(sq "$GIT_OID^{commit}"); git -C tree checkout --detach $(sq "$GIT_OID")"
+      else script="$script; git -C tree checkout --orphan $(sq "$GIT_BRANCH"); git -C tree rm -rf --ignore-unmatch . >/dev/null 2>&1 || true"; fi
+      script="$script; for entry in tree/* tree/.[!.]* tree/..?*; do [ -e \"\$entry\" ] || [ -L \"\$entry\" ] || continue; [ \"\${entry##*/}\" = .git ] || rm -rf -- \"\$entry\"; done"
+    else
+      script="$script; mkdir tree"
+    fi
+  else
+    script="$script; source=\$HOME/$(sq "$REMOTE_DIR"); [ -d \"\$source\" ] && [ ! -L \"\$source\" ]; mkdir tree; cd tree; cp -Rp \"\$source\"/. ."
+  fi
+  ssh_run "$script" || die "failed to build remote whole-tree candidate"
+}
+remote_publish_marker() {
+  local text tmp_dir="$REMOTE_CONTROL/.marker-tmp-$TOKEN"
+  text=$(marker_text)
+  ssh_write "set -eu; cd \"\$HOME\"; umask 077; $(remote_control_dirs_script); marker=$(sq "$REMOTE_CONTROL/marker"); tmp_dir=$(sq "$tmp_dir"); [ ! -e \"\$marker\" ] && [ ! -L \"\$marker\" ]; [ ! -e \"\$tmp_dir\" ] && [ ! -L \"\$tmp_dir\" ]; mkdir \"\$tmp_dir\"; [ -d \"\$tmp_dir\" ] && [ ! -L \"\$tmp_dir\" ]; set -C; cat > \"\$tmp_dir/marker\"; [ -f \"\$tmp_dir/marker\" ] && [ ! -L \"\$tmp_dir/marker\" ]; mv \"\$tmp_dir/marker\" \"\$marker\"; rmdir \"\$tmp_dir\"" "$text"$'\n'
+}
+journal_text() {
+  printf 'schema\t2\ntoken\t%s\noperation\t%s\npre_epoch\t%s\ntarget_epoch\t%s\npre_owner\t%s\ntarget_owner\t%s\ncandidate_container\t%s\nbackup_container\t%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+}
+validate_remote_journal_if_present() {
+  local token=$1 operation=$2 pre=$3 target=$4 pre_owner=$5 target_owner=$6
+  local candidate_container=$7 backup_container=$8 actual expected path
+  path="$REMOTE_CONTROL/txn/$token/journal"
+  actual=$(ssh_read "set -eu; cd \"\$HOME\"; path=$(sq "$path"); if [ -e \"\$path\" ] || [ -L \"\$path\" ]; then $(remote_safe_dir_prelude); require_dir $(sq "$REMOTE_CONTROL/txn/$token"); [ -f \"\$path\" ] && [ ! -L \"\$path\" ]; printf 'present\\n'; cat \"\$path\"; else printf absent; fi") ||
+    die "remote transaction journal is unsafe or unreadable"
+  [ "$actual" != absent ] || return 0
+  expected="present"$'\n'"$(journal_text "$token" "$operation" "$pre" "$target" "$pre_owner" "$target_owner" "$candidate_container" "$backup_container")"
+  [ "$actual" = "$expected" ] || die "remote transaction journal does not match its bound local journal"
+}
+
+remote_publish_journal() {
+  local operation=$1 epoch=$2 candidate_container=$3 backup_container=$4
+  local text pre=${ST_EPOCH:-none} pre_owner=${ST_OWNER:-none} target_owner
+  target_owner=$([ "$operation" = pull ] && printf local || printf remote)
+  text=$(journal_text "$TOKEN" "$operation" "$pre" "$epoch" "$pre_owner" "$target_owner" "$candidate_container" "$backup_container")
+  ssh_write "set -eu; cd \"\$HOME\"; umask 077; $(remote_control_dirs_script); safe_dir $(sq "$REMOTE_CONTROL/txn"); txn=$(sq "$REMOTE_CONTROL/txn/$TOKEN"); [ ! -e \"\$txn\" ] && [ ! -L \"\$txn\" ]; mkdir \"\$txn\"; [ -d \"\$txn\" ] && [ ! -L \"\$txn\" ]; set -C; cat > \"\$txn/journal\"; [ -f \"\$txn/journal\" ] && [ ! -L \"\$txn/journal\" ]" "$text"$'\n'
+}
+remote_prepare_backup() {
+  local initialized=$1 backup_container=$2 backup_nonce
+  [ "$initialized" -eq 1 ] || return 0
+  backup_nonce=$(container_nonce backup "$backup_container")
+  ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; : ompup_backup_move; container=$(sq "$backup_container"); nonce=$(sq "$backup_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ ! -e tree ] && [ ! -L tree ]; [ -d \"\$live\" ] && [ ! -L \"\$live\" ]; move_exact \"\$live\" tree; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ] && [ -d tree ] && [ ! -L tree ]" ||
+    die "remote backup move failed; journal retained for recovery"
+}
+remote_restore_backup_if_live_absent() {
+  local backup_container=$1 backup_nonce
+  backup_nonce=$(container_nonce backup "$backup_container")
+  ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; container=$(sq "$backup_container"); nonce=$(sq "$backup_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ -d tree ] && [ ! -L tree ]; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; move_exact tree \"\$live\"; [ ! -e tree ] && [ ! -L tree ] && [ -d \"\$live\" ] && [ ! -L \"\$live\" ]"
+}
+remote_restore_failed_if_live_absent() {
+  local candidate_container=$1 candidate_nonce
+  candidate_nonce=$(container_nonce candidate "$candidate_container")
+  ssh_run "set -eu; $REMOTE_MOVE_EXACT; cd \"\$HOME\"; container=$(sq "$candidate_container"); nonce=$(sq "$candidate_nonce"); live=\$HOME/$(sq "$REMOTE_DIR"); cd \"\$container\"; [ \"\$(cat .ompup-nonce 2>/dev/null || true)\" = \"\$nonce\" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; [ -d failed ] && [ ! -L failed ]; [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; move_exact failed \"\$live\"; [ ! -e failed ] && [ ! -L failed ] && [ -d \"\$live\" ] && [ ! -L \"\$live\" ]"
+}
+remote_promote_candidate() {
+  local initialized=$1 candidate_container=$2 candidate_nonce live_nonce
+  candidate_nonce=$(container_nonce candidate "$candidate_container")
+  live_nonce=$(container_nonce live "$REMOTE_DIR")
+  ssh_run "set -eu; cd \"\$HOME\"; : ompup_candidate_promotion; candidate=$(sq "$candidate_container"); cnonce=$(sq "$candidate_nonce"); [ -d \"\$candidate\" ] && [ ! -L \"\$candidate\" ]; [ \"\$(cat \"\$candidate/.ompup-nonce\" 2>/dev/null || true)\" = \"\$cnonce\" ] && [ -f \"\$candidate/.ompup-nonce\" ] && [ ! -L \"\$candidate/.ompup-nonce\" ]; [ -d \"\$candidate/tree\" ] && [ ! -L \"\$candidate/tree\" ]; live=$(sq "$REMOTE_DIR"); [ ! -e \"\$live\" ] && [ ! -L \"\$live\" ]; mkdir \"\$live\"; [ -d \"\$live\" ] && [ ! -L \"\$live\" ]; cd \"\$live\"; umask 077; set -C; printf '%s\\n' $(sq "$live_nonce") > .ompup-nonce; [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]; cp -Rp \"\$HOME/\$candidate/tree\"/. .; [ \"\$(cat .ompup-nonce)\" = $(sq "$live_nonce") ]; rm -- .ompup-nonce" ||
+    die "remote candidate promotion failed; journal retained for recovery"
+}
+remote_cleanup_commit() {
+  remove_remote_container "$REMOTE_BACKUP_CONTAINER" backup || return 1
+  REMOTE_BACKUP_CONTAINER=
+  remove_remote_container "$REMOTE_CANDIDATE_CONTAINER" candidate || return 1
+  REMOTE_CANDIDATE_CONTAINER=
+  remote_remove_transaction_artifacts "$TOKEN"
+}
+sync_real() {
+  check_ack
+  acquire_locks
+  read_state; recover_transaction; read_state
+  local initialized=$STATE_PRESENT dest candidate epoch backup old_baseline cleanup_ok=0
+  dest=$(remote_destination_state) || die "cannot inspect remote destination"
+  if [ "$initialized" -eq 0 ]; then
+    [ "$dest" = absent ] || die "remote destination already exists without an adoptable local ledger ($dest)"
+    epoch=1
+    print_policy
+  else
+    [ "$dest" = marked ] || die "remote destination/marker mismatch: $dest"
+    require_remote_tree "$REMOTE_DIR"
+    require_marker; require_git_match; compute_changes
+    require_effective_owner local
+    epoch=$(next_epoch "$ST_EPOCH")
+    build_filters; make_filter_args; FILTER_DIGEST=$(filter_digest); compute_tracked_excluded; check_ack
+  fi
+  prepare_local_txn "$epoch"
+  remote_create_container candidate; REMOTE_CANDIDATE_CONTAINER=$CREATED_REMOTE_CONTAINER
+  remote_create_container backup; REMOTE_BACKUP_CONTAINER=$CREATED_REMOTE_CONTAINER
+  candidate="$REMOTE_CANDIDATE_CONTAINER/tree"
+  remote_make_candidate "$initialized" "$REMOTE_CANDIDATE_CONTAINER"
+  rsync_local_to_remote_container "$ROOT" "$REMOTE_CANDIDATE_CONTAINER"
+  require_remote_tree "$candidate"
+  [ -z "$(compare_remote "$LOCAL_STAGE/after" "$candidate")" ] || die "remote candidate validation failed"
+  require_remote_path_git_match "$candidate"
+  [ -z "$(compare_local "$LOCAL_STAGE/after" "$ROOT")" ] || die "local source changed before publication"
+  if [ "$initialized" -eq 1 ]; then require_marker; require_remote_tree "$REMOTE_DIR"; require_git_match; fi
+  require_live_local_git_tuple
+  write_local_journal_temp sync "$epoch" "$REMOTE_CANDIDATE_CONTAINER" "$REMOTE_BACKUP_CONTAINER"
+  publish_local_journal
+  remote_publish_journal sync "$epoch" "$REMOTE_CANDIDATE_CONTAINER" "$REMOTE_BACKUP_CONTAINER"
+  validate_remote_journal_if_present "$TOKEN" sync "${ST_EPOCH:-none}" "$epoch" "${ST_OWNER:-none}" remote \
+    "$REMOTE_CANDIDATE_CONTAINER" "$REMOTE_BACKUP_CONTAINER"
+  backup="$REMOTE_BACKUP_CONTAINER/tree"
+  remote_prepare_backup "$initialized" "$REMOTE_BACKUP_CONTAINER"
+  if [ "$initialized" -eq 1 ]; then
+    require_remote_tree "$backup"
+    backup_changed=0
+    (require_remote_path_git_match "$backup") || backup_changed=1
+    [ -z "$(compare_remote "$LOCAL_STAGE/before" "$backup")" ] || backup_changed=1
+    if [ "$backup_changed" -eq 1 ]; then
+      live_state=$(remote_destination_state) || die "cannot inspect remote destination after backup move"
+      if [ "$live_state" = absent ] && remote_restore_backup_if_live_absent "$REMOTE_BACKUP_CONTAINER"; then
+        require_remote_tree "$REMOTE_DIR"
+        die "remote destination changed during backup move; restored moved third version and preserved transaction artifacts"
+      fi
+      die "remote destination changed during backup move and live path is occupied; preserved both versions and transaction artifacts"
+    fi
+  fi
+  remote_promote_candidate "$initialized" "$REMOTE_CANDIDATE_CONTAINER"
+  if [ "$initialized" -eq 0 ]; then remote_publish_marker; fi
+  require_remote_tree "$REMOTE_DIR"
+  [ -z "$(compare_remote "$LOCAL_STAGE/after" "$REMOTE_DIR")" ] ||
+    die "remote live validation failed after promotion; transaction artifacts preserved"
+  [ -z "$(compare_local "$LOCAL_STAGE/after" "$ROOT")" ] || die "local source changed before ownership commit"
+  require_marker; require_git_match
+  materialize_baseline "$epoch" "$LOCAL_STAGE/after"
+  ack=${ST_ACK_DIGEST:--}; [ -n "$TRACKED_EXCLUDED" ] && ack=$ACK_DIGEST
+  old_baseline=${ST_BASELINE_EPOCH:-none}
+  require_live_local_git_tuple
+  write_state remote "$epoch" "$epoch" "$ack"
+  if remote_cleanup_commit; then
+    cleanup_ok=1
+    [ "$old_baseline" = none ] || remove_baseline_generation "$old_baseline"
+    safe_remove_local_dir "$LOCAL_STAGE"
+    PUBLISHED=0; LOCAL_STAGE=
+  else
+    warn "handoff committed; remote transaction cleanup remains recoverable"
+  fi
+  ST_OWNER=remote; ST_EPOCH=$epoch; ST_BASELINE_EPOCH=$epoch; STATE_PRESENT=1
+  release_locks
+  say "ompup: synced $ROOT -> $HOST:~/$REMOTE_DIR; owner=remote epoch=$epoch"
+  [ "$cleanup_ok" -eq 1 ] || say "ompup: committed journal retained for cleanup recovery"
+}
+
+pull_real() {
+  [ "$STATE_PRESENT" -eq 1 ] || die "project is not initialized; run ompup sync"
+  check_ack
+  acquire_locks
+  read_state; recover_transaction; read_state; require_marker; require_remote_tree "$REMOTE_DIR"; require_git_match; compute_changes
+  require_effective_owner remote
+  remote_ignore=$(ssh_read "set -eu; cd \"\$HOME\"; path=$(sq "$REMOTE_DIR/.ompupignore"); if [ -e \"\$path\" ] || [ -L \"\$path\" ]; then [ -f \"\$path\" ] && [ ! -L \"\$path\" ] || { echo 'BLOCK:remote .ompupignore must be a regular non-symlink file' >&2; exit 2; }; cat \"\$path\"; fi") ||
+    die "cannot safely read remote exclusion policy"
+  FILTER_KINDS=(); FILTER_RULES=(); RULES_TEXT=
+  add_default_filters
+  add_ignore_text "$remote_ignore" "remote .ompupignore"
+  add_extra_filters
+  make_filter_args; FILTER_DIGEST=$(filter_digest); compute_tracked_excluded; check_ack
+  epoch=$(next_epoch "$ST_EPOCH")
+  create_local_txn_dirs
+  write_rules "$LOCAL_STAGE/rules"
+  rsync_copy_local "$ROOT" "$LOCAL_STAGE/before"
+  require_remote_tree "$REMOTE_DIR"
+  rsync_remote_to_local "$REMOTE_DIR" "$LOCAL_STAGE/after"
+  [ -z "$(compare_remote "$LOCAL_STAGE/after" "$REMOTE_DIR")" ] || die "remote source changed while staging pull"
+
+  parent=${ROOT%/*}; [ -n "$parent" ] || parent=/
+  create_local_container candidate "$parent"; LOCAL_CANDIDATE_CONTAINER=$CREATED_CONTAINER
+  create_local_container backup "$parent"; LOCAL_BACKUP_CONTAINER=$CREATED_CONTAINER
+  mkdir "$LOCAL_CANDIDATE_CONTAINER/tree" || die "cannot create local candidate tree"
+  require_local_container "$LOCAL_CANDIDATE_CONTAINER" candidate
+  (
+    cd "$LOCAL_CANDIDATE_CONTAINER/tree"
+    cp -Rp "$ROOT"/. .
+  ) || die "failed to copy local Git boundary into candidate"
+  rsync_copy_local "$LOCAL_STAGE/after" "$LOCAL_CANDIDATE_CONTAINER/tree"
+  validate_tree "$LOCAL_CANDIDATE_CONTAINER/tree"
+  [ -z "$(compare_local "$LOCAL_STAGE/after" "$LOCAL_CANDIDATE_CONTAINER/tree")" ] || die "local candidate validation failed"
+  require_local_path_git_match "$LOCAL_CANDIDATE_CONTAINER/tree"
+  [ -z "$(compare_local "$LOCAL_STAGE/before" "$ROOT")" ] || die "local destination changed before publication"
+  require_live_local_git_tuple
+  write_local_journal_temp pull "$epoch" "$LOCAL_CANDIDATE_CONTAINER" "$LOCAL_BACKUP_CONTAINER"
+  publish_local_journal
+
+  require_local_container "$LOCAL_BACKUP_CONTAINER" backup
+  live_nonce=$(container_nonce live "$ROOT")
+  (
+    cd "$LOCAL_BACKUP_CONTAINER"
+    [ ! -e tree ] && [ ! -L tree ]
+    move_exact "$ROOT" tree || exit 1
+    [ -d tree ] && [ ! -L tree ] && [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ]
+  ) || die "local backup move failed; journal retained for recovery"
+  validate_tree "$LOCAL_BACKUP_CONTAINER/tree"
+  backup_changed=0
+  (require_local_path_git_match "$LOCAL_BACKUP_CONTAINER/tree") || backup_changed=1
+  [ -z "$(compare_local "$LOCAL_STAGE/before" "$LOCAL_BACKUP_CONTAINER/tree")" ] || backup_changed=1
+  if [ "$backup_changed" -eq 1 ]; then
+    if [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ]; then
+      (
+        cd "$LOCAL_BACKUP_CONTAINER"
+        move_exact tree "$ROOT" || exit 1
+        [ ! -e tree ] && [ ! -L tree ] && [ -d "$ROOT" ] && [ ! -L "$ROOT" ]
+      ) || die "moved local third version could not be restored; preserved transaction artifacts"
+      LOCAL_INSPECT_ROOT=$ROOT
+      cd "$ROOT"
+      die "local destination changed during backup move; restored moved third version and preserved transaction artifacts"
+    fi
+    die "local destination changed during backup move and live path is occupied; preserved both versions and transaction artifacts"
+  fi
+
+  require_local_container "$LOCAL_CANDIDATE_CONTAINER" candidate
+  [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ] || die "concurrent local destination blocks promotion"
+  mkdir "$ROOT" || die "cannot exclusively create local live destination"
+  [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || die "new local live destination is unsafe"
+  write_exclusive_file "$ROOT/.ompup-nonce" "$live_nonce"$'\n'
+  (
+    cd "$ROOT"
+    [ "$(cat .ompup-nonce)" = "$live_nonce" ] && [ -f .ompup-nonce ] && [ ! -L .ompup-nonce ]
+    cp -Rp "$LOCAL_CANDIDATE_CONTAINER/tree"/. .
+    [ "$(cat .ompup-nonce)" = "$live_nonce" ]
+    rm -- .ompup-nonce
+  ) || die "local candidate promotion failed; journal retained for recovery"
+  LOCAL_INSPECT_ROOT=$ROOT
+  cd "$ROOT"
+  validate_tree "$ROOT"
+  [ -z "$(compare_local "$LOCAL_STAGE/after" "$ROOT")" ] ||
+    die "local live validation failed; transaction artifacts preserved"
+  require_local_path_git_match "$ROOT"
+  require_marker; require_remote_tree "$REMOTE_DIR"; require_git_match
+  [ -z "$(compare_remote "$LOCAL_STAGE/after" "$REMOTE_DIR")" ] ||
+    die "remote source changed before ownership commit; transaction artifacts preserved"
+  materialize_baseline "$epoch" "$LOCAL_STAGE/after"
+  ack=$ST_ACK_DIGEST; [ -n "$TRACKED_EXCLUDED" ] && ack=$ACK_DIGEST
+  old_baseline=$ST_BASELINE_EPOCH
+  require_live_local_git_tuple
+  write_state local "$epoch" "$epoch" "$ack"
+  remove_baseline_generation "$old_baseline"
+  remove_local_container "$LOCAL_BACKUP_CONTAINER" backup; LOCAL_BACKUP_CONTAINER=
+  remove_local_container "$LOCAL_CANDIDATE_CONTAINER" candidate; LOCAL_CANDIDATE_CONTAINER=
+  safe_remove_local_dir "$LOCAL_STAGE"
+  PUBLISHED=0; LOCAL_STAGE=
+  ST_OWNER=local; ST_EPOCH=$epoch; ST_BASELINE_EPOCH=$epoch
+  release_locks
+  say "ompup: pulled $HOST:~/$REMOTE_DIR -> $ROOT; owner=local epoch=$epoch"
+}
+
+dry_run() {
+  say "dry-run: no managed mutations"
+  say "identity-kind: $IDENTITY_KIND"; say "identity: $IDENTITY_HASH"; say "address: $ADDRESS"; say "remote: $HOST:~/$REMOTE_DIR"
+  print_policy; check_ack
+  dest=$(remote_destination_state) || die "cannot inspect remote destination"
+  if [ "$STATE_PRESENT" -eq 0 ]; then
+    [ "$CMD" = sync ] || die "project is not initialized; pull has no source ledger"
+    [ "$dest" = absent ] || die "remote destination collision: $dest"
+    if [ "$IDENTITY_KIND" = git ]; then
+      [ "$GIT_OID" != - ] || die "unborn initial Git cloneability cannot be proven read-only"
+      refs=$(ssh_read "git ls-remote -- $(sq "$ORIGIN") 2>/dev/null") || die "remote cannot read Git origin"
+      case "$refs" in *"$GIT_OID"*) ;; *) die "exact local HEAD cloneability is not provable read-only" ;; esac
+    fi
+    say "planned: create candidate, validate, swap into absent destination, owner local -> remote"
+    return
+  fi
+  require_marker; require_git_match; compute_changes
+  print_change_set local-changed "$LOCAL_CHANGES"; print_change_set remote-changed "$REMOTE_CHANGES"; print_change_set common-changed "$(common_changes)"
+  if [ "$CMD" = sync ]; then require_effective_owner local; say "planned: whole-tree remote candidate and swap; owner local -> remote"
+  else require_effective_owner remote; say "planned: whole-tree local candidate and swap; owner remote -> local"; fi
+}
+
+status_cmd() {
+  say "local-root: $ROOT"; say "identity-kind: $IDENTITY_KIND"; say "identity: $IDENTITY_HASH"; say "address: $ADDRESS"; say "remote: $HOST:~/$REMOTE_DIR"
+  say "local-git: $GIT_MODE $GIT_BRANCH $GIT_OID"
+  if ! dest=$(remote_destination_state 2>/dev/null); then
+    dest=unreachable
+    say "remote-destination: $dest"
+    if [ "$STATE_PRESENT" -eq 0 ]; then say "committed-owner: (uninitialized)"; else say "committed-owner: $ST_OWNER"; say "epoch: $ST_EPOCH"; fi
+    say "effective-owner: unknown-conflict"; say "local-changed: (not compared)"; say "remote-changed: (not compared)"
+    say "blocker: remote connectivity failed"; say "tmux: unknown $SESSION"; return 0
+  fi
+  say "remote-destination: $dest"
+  if [ "$STATE_PRESENT" -eq 0 ]; then
+    say "committed-owner: (uninitialized)"; say "effective-owner: unknown-conflict"; print_policy
+    if [ "$dest" = absent ]; then say "blocker: run ompup sync"; else say "blocker: remote destination collision: $dest"; fi
+    return 0
+  fi
+  if [ "$dest" != marked ]; then
+    say "remote-git: (not inspected)"; say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    say "local-changed: (not compared)"; say "remote-changed: (not compared)"
+    say "blocker: remote destination/marker mismatch: $dest"; say "tmux: unknown $SESSION"; return 0
+  fi
+  if ! ssh_read "$(remote_validate_tree_script "$REMOTE_DIR")" >/dev/null 2>&1; then
+    say "remote-git: (not inspected)"; say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    say "local-changed: (not compared)"; say "remote-changed: (not compared)"
+    say "blocker: remote tree validation failed"; say "tmux: unknown $SESSION"; return 0
+  fi
+  if ! marker=$(ssh_read "cd \"\$HOME\"; cat $(sq "$REMOTE_CONTROL/marker") 2>/dev/null"); then
+    say "remote-git: (not inspected)"; say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    say "local-changed: (not compared)"; say "remote-changed: (not compared)"
+    say "blocker: remote marker missing"; say "tmux: unknown $SESSION"; return 0
+  fi
+  if ! validate_marker_text "$marker"; then
+    say "remote-git: (not inspected)"; say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    say "local-changed: (not compared)"; say "remote-changed: (not compared)"
+    say "blocker: remote marker invalid: $MARKER_ERROR"; say "tmux: unknown $SESSION"; return 0
+  fi
+  if ! tuple=$(ssh_read "$(remote_git_tuple_script "$REMOTE_DIR")" 2>/dev/null); then
+    say "remote-git: (invalid)"; say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    say "local-changed: (not compared)"; say "remote-changed: (not compared)"
+    say "blocker: ${tuple:-remote Git validation failed}"; say "tmux: unknown $SESSION"; return 0
+  fi
+  IFS=$'\t' read -r REMOTE_GIT_MODE REMOTE_GIT_BRANCH REMOTE_GIT_OID extra <<< "$tuple"
+  if [ -n "${extra:-}" ] || [ -z "$REMOTE_GIT_MODE" ]; then
+    say "remote-git: (malformed)"; say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    say "local-changed: (not compared)"; say "remote-changed: (not compared)"
+    say "blocker: malformed remote Git tuple"; say "tmux: unknown $SESSION"; return 0
+  fi
+  say "remote-git: $REMOTE_GIT_MODE $REMOTE_GIT_BRANCH $REMOTE_GIT_OID"
+  if [ "$REMOTE_GIT_MODE/$REMOTE_GIT_BRANCH/$REMOTE_GIT_OID" != "$GIT_MODE/$GIT_BRANCH/$GIT_OID" ]; then
+    say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    say "local-changed: (not compared)"; say "remote-changed: (not compared)"
+    say "blocker: Git tuple diverged"; say "tmux: unknown $SESSION"; return 0
+  fi
+  load_frozen_filters
+  if ! LOCAL_CHANGES=$(compare_local "$BASELINES/$ST_BASELINE_EPOCH/tree" "$ROOT"); then
+    say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    say "local-changed: (comparison failed)"; say "remote-changed: (not compared)"
+    say "blocker: local change comparison failed"; say "tmux: unknown $SESSION"; return 0
+  fi
+  if ! REMOTE_CHANGES=$(compare_remote "$BASELINES/$ST_BASELINE_EPOCH/tree" "$REMOTE_DIR"); then
+    say "committed-owner: $ST_OWNER"; say "effective-owner: unknown-conflict"; say "epoch: $ST_EPOCH"
+    print_change_set local-changed "$LOCAL_CHANGES"; say "remote-changed: (comparison failed)"
+    say "blocker: remote connectivity/change comparison failed"; say "tmux: unknown $SESSION"; return 0
+  fi
+  blocker=none; effective=$ST_OWNER; common=$(common_changes)
+  if [ -n "$LOCAL_CHANGES" ] && [ -n "$REMOTE_CHANGES" ]; then blocker='both sides changed'; effective=unknown-conflict
+  elif [ "$ST_OWNER" = remote ] && [ -n "$LOCAL_CHANGES" ]; then blocker='non-owning local side changed'; effective=unknown-conflict
+  elif [ "$ST_OWNER" = local ] && [ -n "$REMOTE_CHANGES" ]; then blocker='non-owning remote side changed'; effective=unknown-conflict
+  fi
+  if pending=$(ssh_read "cd \"\$HOME\"; { [ -d $(sq "$REMOTE_LOCK") ] && echo lock; find $(sq "$REMOTE_CONTROL/txn") -type f -name journal -print 2>/dev/null || true; }" 2>/dev/null); then
+    [ -z "$pending" ] || { blocker="pending transaction or lock: $pending"; effective=unknown-conflict; }
+  else
+    blocker='remote connectivity failed while inspecting transactions'; effective=unknown-conflict
+  fi
+  say "committed-owner: $ST_OWNER"; say "effective-owner: $effective"; say "epoch: $ST_EPOCH"
+  print_change_set local-changed "$LOCAL_CHANGES"; print_change_set remote-changed "$REMOTE_CHANGES"; print_change_set common-changed "$common"
+  say "filter-digest: $ST_FILTER_DIGEST"; say "exclude-ack-digest: $ST_ACK_DIGEST"; say "blocker: $blocker"
+  if ssh_read "tmux has-session -t $(sq "=$SESSION") 2>/dev/null" >/dev/null 2>&1; then say "tmux: running $SESSION"; else say "tmux: absent $SESSION"; fi
+}
+
+effective_owner() {
+  require_marker; require_git_match; compute_changes
+  if [ -n "$LOCAL_CHANGES" ] && [ -n "$REMOTE_CHANGES" ]; then
+    print_change_set local-changed "$LOCAL_CHANGES"; print_change_set remote-changed "$REMOTE_CHANGES"; die "ownership is unknown-conflict"
+  fi
+  if [ "$ST_OWNER" = remote ] && [ -n "$LOCAL_CHANGES" ]; then
+    print_change_set local-changed "$LOCAL_CHANGES"; die "non-owning local side changed; ownership is unknown-conflict"
+  fi
+  if [ "$ST_OWNER" = local ] && [ -n "$REMOTE_CHANGES" ]; then
+    print_change_set remote-changed "$REMOTE_CHANGES"; die "non-owning remote side changed; ownership is unknown-conflict"
+  fi
+  printf '%s' "$ST_OWNER"
+}
+attach_cmd() {
+  [ "$STATE_PRESENT" -eq 1 ] || die "project is not initialized; run ompup sync"
+  owner=$(effective_owner); [ "$owner" = remote ] || die "remote does not own the tree; run ompup sync"
+  ssh_read "cd \"\$HOME\"; [ ! -d $(sq "$REMOTE_LOCK") ] && [ -z \"\$(find $(sq "$REMOTE_CONTROL/txn") -type f -name journal -print -quit 2>/dev/null || true)\" ]" >/dev/null 2>&1 || die "data lock or transaction is active; attach refused"
+  ssh_run "command -v tmux >/dev/null && command -v bash >/dev/null" || die "required remote command not found: tmux or bash"
+  if [ "$1" = shell ]; then command_text='exec "${SHELL:-/bin/sh}"'
+  else command_text="$LAUNCH; exec \"\${SHELL:-/bin/sh}\""; fi
+  tmux_command="bash -lc $(sq "$command_text")"
+  exec ssh -t "$HOST" "LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 tmux -u new-session -A -s $(sq "$SESSION") -c \"\$HOME/$REMOTE_DIR\" $(sq "$tmux_command")"
+}
+
+case "$CMD" in
+  status) status_cmd ;;
+  sync) if [ "$DRY_RUN" -eq 1 ]; then dry_run; else sync_real; fi ;;
+  pull) if [ "$DRY_RUN" -eq 1 ]; then dry_run; else pull_real; fi ;;
+  attach) attach_cmd omp ;;
+  shell)
+    if [ "$STATE_PRESENT" -eq 1 ]; then
+      owner=$(effective_owner)
+      [ "$owner" != remote ] || die "remote already owns the tree; run ompup attach"
+    fi
+    sync_real
+    attach_cmd shell ;;
+  up)
+    if [ "$STATE_PRESENT" -eq 1 ]; then
+      owner=$(effective_owner)
+      [ "$owner" != remote ] || die "remote already owns the tree; run ompup attach"
+    fi
+    sync_real
+    attach_cmd omp ;;
+esac

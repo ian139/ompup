@@ -1,31 +1,26 @@
 {
   "name": "ompup",
-  "version": "0.6.0",
-  "description": "Continue local Oh My Pi projects on the best available persistent remote machine",
+  "version": "0.2.0",
+  "description": "Explicit local/remote handoff for Oh My Pi sessions",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/wolfiesch/ompup.git"
-  },
-  "homepage": "https://github.com/wolfiesch/ompup",
-  "bugs": {
-    "url": "https://github.com/wolfiesch/ompup/issues"
-  },
-  "bin": {
-    "ompup": "./bin/ompup"
-  },
-  "files": [
-    "bin/ompup",
-    "src/ompup/*.py",
-    "extension/index.ts",
-    "README.md",
-    "LICENSE"
-  ],
+  "repository": { "type": "git", "url": "https://github.com/wolfiesch/ompup.git" },
+  "type": "module",
+  "files": ["bin/ompup", "extension/index.ts", "CHANGELOG.md", "LICENSE", "README.md"],
+  "bin": { "ompup": "./bin/ompup" },
+  "omp": { "extensions": ["./extension/index.ts"] },
+  "keywords": ["oh-my-pi", "omp", "tmux", "ssh", "rsync", "remote-development"],
   "scripts": {
-    "test": "python3 -m unittest discover -s tests -v && bun test tests/extension.test.ts"
+    "check:bash": "bash -n bin/ompup tests/test-cli.sh tests/test-localhost-ssh.sh tests/test-pack.sh tests/fixtures/mv tests/fixtures/ssh tests/fixtures/tmux",
+    "check:shellcheck": "shellcheck --severity=warning --exclude=SC1007,SC2016,SC2029,SC2034,SC2071 bin/ompup && shellcheck --severity=warning --exclude=SC2016,SC2029 tests/test-cli.sh tests/test-localhost-ssh.sh tests/test-pack.sh tests/fixtures/mv tests/fixtures/ssh tests/fixtures/tmux",
+    "test:cli": "bash tests/test-cli.sh",
+    "test:extension": "bun test tests/extension.test.ts",
+    "typecheck": "tsc --noEmit",
+    "test:localhost-ssh": "bash tests/test-localhost-ssh.sh",
+    "pack:check": "bash tests/test-pack.sh",
+    "check": "bun run check:bash && bun run check:shellcheck && bun run test:cli && bun run test:extension && bun run typecheck && bun run test:localhost-ssh && bun run pack:check"
   },
-  "omp": {
-    "extensions": ["./extension/index.ts"]
-  },
-  "keywords": ["oh-my-pi", "omp", "tmux", "ssh", "rsync", "remote-development", "multi-host", "cmux"]
+  "peerDependencies": { "@oh-my-pi/pi-coding-agent": ">=17.3.4" },
+  "devDependencies": { "@oh-my-pi/pi-coding-agent": "17.3.4", "@oh-my-pi/pi-tui": "17.3.4", "@types/bun": "1.3.14", "typescript": "5.9.3" },
+  "engines": { "bun": ">=1.3.14" },
+  "packageManager": "bun@1.3.14"
 }

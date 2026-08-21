@@ -1,214 +1,176 @@
 # ompup
 
-Jump from any local project into a persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) session on the best available remote machine.
-
-ompup probes configured hosts, honors project and workload affinity, pins the first placement, transfers Git commits and uncommitted state safely, attaches a project-named tmux session, and launches `omp`. Remote OMP configuration is preserved by default. An explicit `environment.mode: "mirror"` opt-in can align selected configuration, skills, extensions, plugins, authentication, and OMP versions. The `/ompup handoff` extension command also moves the current live conversation into remote tmux and replaces its cmux surface in place.
+`ompup` hands one project tree between a local machine and a persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) session over SSH. It is an explicit two-copy handoff, not continuous sync or a merge tool.
 
 ```bash
-ompup                       # current Git project
-ompup UFC-pokedex           # named project from any directory
-ompup --pick                # interactive project picker
-ompup --cmux                # open or reuse a cmux workspace
-/ompup handoff              # from inside local omp running in cmux
-ompup env status --all      # inspect remote OMP without changing it
-ompup env sync --all        # mirror mode only: align every reachable machine
-ompup auth status           # optional: verify a configured credential broker
+export OMPUP_HOST=my-devbox       # an SSH alias is recommended
+cd ~/src/my-project
+ompup                            # sync, then attach only after a safe handoff
 ```
 
-## How it works
+The remote tmux session survives disconnects. If the remote already owns the tree, use `ompup attach`; the default command deliberately refuses to overwrite or resync it.
+
+## Ownership model
+
+A committed ledger records exactly one owner. Every mutation compares both copies with the last committed baseline and fails closed when reality disagrees.
+
+| State | Meaning | Allowed next handoff |
+|---|---|---|
+| uninitialized | No trusted local ledger exists and the addressed remote path is absent | `sync` |
+| local-owned | Only the local copy may change | `sync` hands ownership to remote |
+| remote-owned | Only the remote copy may change | `pull` hands ownership to local; `attach` transfers nothing |
+| unknown-conflict | Both sides changed, the non-owner changed, identity/marker/Git validation failed, or a lock/transaction is unresolved | inspect `status`, reconcile the reported paths or recovery artifact, then retry; there is no force mode |
+
+| Command | Data transfer and ownership effect |
+|---|---|
+| `ompup` | From uninitialized/local-owned: `sync`, then attach OMP. From remote-owned: refuse and require `attach`. |
+| `ompup sync` | Require uninitialized/local-owned; publish local to remote as a whole-tree swap; commit remote-owned. |
+| `ompup pull` | Require remote-owned; publish remote to local as a whole-tree swap; commit local-owned. |
+| `ompup attach` | Require an initialized, effectively remote-owned, unlocked tree; attach/create its tmux session and run `OMPUP_CMD`. No sync. |
+| `ompup shell` | From uninitialized/local-owned: sync, then attach a plain remote shell. It refuses when remote already owns the tree. |
+| `ompup status` | Read-only identity, local/remote Git tuples, committed/effective owner, epoch, changed paths, blocker, and tmux state. Connectivity failures are reported as blockers. |
+
+`sync` uses deletion inside a candidate to make the managed remote tree match local. `pull` also stages an exact managed candidate before swapping it into place. Neither command merges content.
+
+## Identity, layout, and state
+
+The address is `<readable-slug>--<12-hex-hash>` and the tmux session is `ompup-<slug>-<12-hex-hash>` (the session slug is capped at 32 characters). Hashes are stable protocol identifiers, not security claims.
+
+- **Git identity:** SHA-1 of a domain separator and the exact, single `remote.origin.url`. The local ledger additionally binds the physical local root.
+- **Non-Git identity:** SHA-1 of a domain separator and the absolute physical path from `pwd -P`; content changes never change identity.
+- **Target identity:** SHA-1 of the exact `OMPUP_HOST` and `OMPUP_REMOTE_ROOT`.
+
+Local state is stored under `${XDG_STATE_HOME:-$HOME/.local/state}/ompup`:
 
 ```text
-local Git commits + working-tree objects ────────> ~/Projects/<name>
-local session JSONL + artifacts ──────────────> ~/.local/state/ompup/handoffs/...
-                                                         │
-                                                   tmux + omp --resume
-                                                         │
-                                                   cmux SSH surface
+targets/<target-hash>/<address>/state
+targets/<target-hash>/<address>/baselines/<epoch>/{tree,rules}
+targets/<target-hash>/<address>/transactions/<token>/{journal,before,after,rules}
+locks/<target-hash>--<address>.lock/
 ```
 
-- Git negotiates commit and working-snapshot objects directly with temporary `refs/ompup/*` references, so subsequent transfers send only objects the destination lacks. Fast-forward commits transfer automatically in either direction; divergent history fails visibly.
-- A temporary Git index captures tracked files plus untracked, non-ignored files as an exact tree without materializing a second filesystem copy. Dependency directories, build output, ignored files, and sensitive paths stay out of the snapshot.
-- Every successful transfer records the exact Git HEAD and snapshot tree. A later transfer proceeds only when the destination still matches that baseline. Temporary transport references are removed after application. Conflicting edits and repository-name collisions fail visibly.
-- The first transfer scans reachable history, each later commit transfer scans only incoming history, and every transferred working tree is represented as a synthetic root commit and scanned with `gitleaks`.
-- An existing tmux session is reattached without synchronizing files beneath the running process. Use `ompup sync` explicitly when you want a later local change transferred.
-- Host selection is sticky. Live capacity chooses the first placement; the project remains pinned until `ompup unpin`.
-- A live handoff waits for OMP to become idle, syncs the project, copies the session and artifacts into a private remote state directory, verifies the checksum and remote export, and starts OMP in tmux. Only then does cmux replace the local surface.
-- In `mirror` mode, an OMP launch or live handoff requires the selected machine to match the generated environment fingerprint and OMP version. Each managed tmux session records the fingerprint it started with. In the default `preserve` mode, ompup verifies that remote OMP launches but does not read or change its configuration.
-- Commands for a selected host reuse a private, process-scoped SSH control connection for 60 seconds. Live-session files and artifacts still use resumable rsync over that connection.
+Remote data is relative to the SSH account's real home:
+
+```text
+~/<remote-root>/<address>/
+~/<remote-root>/.ompup-v2/<address>/marker
+~/<remote-root>/.ompup-v2/<address>/txn/<token>/journal
+~/<remote-root>/.ompup-v2/locks/<address>.lock/
+~/<remote-root>/.ompup-{candidate,backup,failed}-<address>-<token>
+```
+
+The marker is validated before an existing destination is trusted. It records schema `2`, the full identity hash and kind, address, and creating version. A pre-existing unmarked directory is never adopted. In particular, the v0.1 path `~/Projects/<basename>` is left untouched; v0.2 neither migrates nor adopts it.
+
+## Git boundary
+
+`.git` is an immutable transfer boundary: every file or directory named `.git`, including nested ones and worktree `.git` files, is excluded in both directions. Initial Git sync makes the remote candidate with `git clone --no-checkout --origin origin` from the exact origin, then establishes the exact local branch/detached/unborn mode and HEAD before copying managed working-tree data. Later swaps copy each side's own `.git` internally; rsync never transports it.
+
+Both sides must retain the same exact origin, HEAD mode, branch, and commit. Ompup rejects staged index changes, unmerged entries, sparse checkouts, Gitlinks/submodules, and merge/cherry-pick/revert/rebase operations. The initial commit must be fetchable by the remote origin (an unborn branch is supported by real sync, but cannot be proven by initial `--dry-run`). Normal unstaged and untracked working-tree files are handoff data unless excluded.
+
+The Git index and staging state are never synchronized. Commit graph changes are not merged or fetched for you; advance both repositories deliberately before handing off. `.gitignore`, `.gitattributes`, and `.gitmodules` are ordinary managed files, although a Gitlink in the index makes the project unsupported.
+
+**Credential warning:** the exact origin URL is embedded, shell-quoted, in the remote clone command. Do not use an origin URL containing a password, token, or other embedded credential. Prefer an SSH origin whose key is already available on the remote.
+
+## Crash-safe publication and recovery
+
+Mutations acquire both local and remote locks. They materialize and validate a complete candidate, durably publish a journal, rename the live directory to a same-filesystem backup, rename the candidate live, validate again, create the new baseline, and write ownership state last. Backups and journals make the rename gap recoverable.
+
+The next mutating command recovers one valid interrupted transaction to its validated pre-tree, or finalizes cleanup when state was already committed. If a live tree, backup, journal, marker, symlink, or epoch does not match the bound transaction, ompup preserves the evidence and blocks instead of guessing or deleting a third version. `status` reports pending remote locks/transactions. A stale local lock is never auto-broken: inspect its PID/token and related journals, then remove only the verified stale lock before retrying. Signals run best-effort candidate and owned-lock cleanup; after machine loss, use the same command to invoke journal recovery.
+
+## Exclusions and trust boundary
+
+The filter is a convenience denylist, **not a secret scanner**. Review `ompup sync --dry-run` before first use. Ompup lists tracked files omitted by the active policy and requires `--acknowledge-excluded`; the acknowledgement is bound to the filter and omitted-path digest, so a policy change may require acknowledgement again.
+
+Rules are applied in this order:
+
+```text
+exclude .git
+include .ompupignore
+include .env.example
+include .env.sample
+exclude .env
+exclude .env.*
+exclude *.pem
+exclude *.key
+exclude *.p12
+exclude *.pfx
+exclude .ssh/
+exclude .aws/
+exclude .gnupg/
+exclude .netrc
+exclude .npmrc
+exclude .pypirc
+exclude .git-credentials
+exclude .docker/config.json
+exclude .kube/
+exclude .config/gh/hosts.yml
+exclude node_modules/
+exclude .venv/
+exclude venv/
+exclude __pycache__/
+exclude .pytest_cache/
+exclude .mypy_cache/
+exclude target/
+exclude dist/
+exclude build/
+exclude .next/
+exclude .turbo/
+exclude .cache/
+exclude .DS_Store
+```
+
+`.env.example` and `.env.sample` are intentional templates and remain included. Put additional LF-separated rsync exclude patterns in the project-root `.ompupignore`. `OMPUP_EXCLUDES` adds colon-separated patterns. The remote `.ompupignore` controls a pull, while the local file controls a sync. CR/TAB policy text is rejected. Anyone who can write the project or these rules can influence what is copied; inspect the effective policy and do not treat it as a confidentiality boundary.
+
+## Options and configuration
+
+`--dry-run` applies only to `sync` and `pull`. It prints identity, destination, policy, changes, and the planned ownership transition without managed writes; it still contacts the remote and may run read-only Git checks. `--acknowledge-excluded` also applies only to those commands.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OMPUP_HOST` | required | One safe SSH alias or `user@host` token. Use `~/.ssh/config` aliases for ports, proxy jumps, identities, and other SSH settings. |
+| `OMPUP_REMOTE_ROOT` | `Projects` | Safe relative path below remote `$HOME`; absolute paths, `.`/`..`, empty segments, and shell characters are rejected. |
+| `OMPUP_CMD` | `omp` | Remote Bash text launched inside the tmux session. CR/LF/TAB are rejected; the trusted value is intentionally evaluated by remote `bash -lc`. |
+| `OMPUP_EXCLUDES` | empty | Extra colon-separated rsync excludes. |
+| `XDG_STATE_HOME` | `$HOME/.local/state` | Local state base. |
+| `OMPUP_STATUS_TIMEOUT_MS` | `30000` | Positive integer timeout used by the OMP extension for `status`. |
+| `OMPUP_OPERATION_TIMEOUT_MS` | `120000` | Positive integer timeout used by the OMP extension for `sync`/`pull`. |
+
+`help`/`--help` and `version`/`--version` do not require configuration or dependencies.
 
 ## Requirements
 
-- Local: Python 3.12 or newer, `ssh`, `git`, and `gitleaks`; live session handoff also requires `rsync`, mirror mode requires Mike Farah `yq` v4, and cmux is required for in-place handoff
-- Remote: Python 3.7 or newer, Bash, `tmux`, `git`, and `omp`; live session handoff also requires `rsync`
-- An SSH host or alias that reaches your box (an entry in `~/.ssh/config` works well)
+- OMP **>= 17.3.4** and Bun **>= 1.3.14** for the extension.
+- Local: Bash 3.2 or newer, SSH client, rsync, and Git.
+- Remote: SSH service plus Bash, rsync, Git (for Git projects), tmux (for attach/status), and `omp` or the configured command.
+- Tested targets: macOS with system openrsync/rsync 2.6.9 compatibility and current Linux.
+- The remote account must be able to create directories and atomic same-filesystem renames below its home. Initial Git sync also requires remote access to the exact origin and local access to the same commit.
 
-## Install
+## Install, upgrade, and rollback
 
-### CLI
-
-```bash
-git clone https://github.com/wolfiesch/ompup.git
-ln -s "$PWD/ompup/bin/ompup" ~/.local/bin/ompup   # or anywhere on PATH
-mkdir -p ~/.config/ompup
-```
-
-### Oh My Pi extension
-
-The same repo is an omp plugin. It adds `/ompup sync`, `/ompup pull`, `/ompup status`, and `/ompup handoff`. Handoff resumes the exact persisted conversation on the selected host, replaces the calling cmux surface with SSH attached to remote tmux, and shuts down the local OMP process.
+Install the pinned CLI from npm, then set a host alias:
 
 ```bash
-omp plugin link ./ompup      # from the clone
+npm install --global ompup@0.2.0
+export OMPUP_HOST=my-devbox
+ompup --version
 ```
 
-Or point omp at it directly:
+To use the slash command from a source/package directory, link its manifest with OMP and keep that directory installed:
 
 ```bash
-omp --extension ./ompup/extension/index.ts
+omp plugin link /absolute/path/to/ompup
 ```
 
-## Usage
+The manifest loads `extension/index.ts`, which invokes the bundled `bin/ompup` when present and otherwise falls back explicitly to `ompup` on `PATH`. `/ompup [sync|pull|status]` is a **user slash command**, not an LLM tool. Mutating verbs require an interactive UI; the extension reports progress, enforces the timeout variables above, preserves full failure/truncated output in a private temporary artifact, and never attaches the current terminal. Use the standalone CLI for `attach` and `shell`.
 
-| Command | Effect |
-|---|---|
-| `ompup [PROJECT]` | Select a host, bootstrap or sync when needed, then attach tmux and launch omp |
-| `ompup --pick` | Interactively choose a project |
-| `ompup sync [PROJECT]` | Safely transfer fast-forward commits and local uncommitted state, no attach |
-| `ompup pull [PROJECT]` | Safely transfer fast-forward commits and remote uncommitted state to local |
-| `ompup status [PROJECT]` | Show selected host, capacity banner, Git synchronization, and tmux state |
-| `ompup doctor [PROJECT]` | Probe every host and explain the selection |
-| `ompup hosts` | Show live reachability, tools, platform, load, memory, disk, and latency |
-| `ompup pin HOST [PROJECT]` | Pin a project to a configured host |
-| `ompup unpin [PROJECT]` | Return a project to automatic placement |
-| `ompup shell [PROJECT]` | Bootstrap or sync when needed, then attach a plain shell |
-| `ompup [PROJECT] --cmux` | Open or reuse a named cmux workspace for the remote session |
-| `/ompup handoff` | Wait for idle, transfer and verify this session, start remote OMP, then replace the current cmux surface |
-| `/ompup handoff --host HOST` | Hand the session to a specific configured host |
-| `ompup env status --all` | Compare the local shared-environment fingerprint with every configured host |
-| `ompup env sync --all` | Update OMP, transfer the safe declarative environment, provision broker tokens over SSH, and verify each reachable host |
-| `ompup auth setup` | Copy the broker bearer token over SSH into a local mode-0600 file and configure the broker URL |
-| `ompup auth status` | Verify authenticated broker access without printing the token |
-| `ompup auth migrate [--dry-run]` | Move local stored credentials, including OAuth accounts, into the broker |
-
-## Host configuration
-
-Create `~/.config/ompup/hosts.json`:
-
-```json
-{
-  "hosts": [
-    {
-      "name": "compute",
-      "ssh": "compute-box",
-      "roles": ["general", "linux", "auth"],
-      "reserve_gb": 40,
-      "priority": 0,
-      "launch": "omp"
-    },
-    {
-      "name": "storage",
-      "ssh": "storage-box",
-      "roles": ["general", "linux", "storage"],
-      "reserve_gb": 100,
-      "priority": 10,
-      "launch": "omp"
-    },
-    {
-      "name": "mac",
-      "ssh": "mac-worker",
-      "roles": ["general", "macos", "arm64"],
-      "reserve_gb": 25,
-      "priority": 0,
-      "remote_root": "Projects",
-      "remote_agent_home": ".omp/agent",
-      "remote_config_root": ".omp",
-      "launch": "$HOME/.local/bin/omp"
-    }
-  ],
-  "environment": {
-    "mode": "preserve"
-  }
-}
-```
-
-Add machines by appending host objects. No source change is required.
-
-Selection precedence:
-
-1. Explicit `--host`
-2. Project pin stored in local Git config
-3. A unique live tmux session
-4. A unique existing remote checkout
-5. Capability and live-capacity score for new placement
-
-The capacity score uses declared roles, minimum free-space reserves, free disk, normalized load, available memory, and optional priority. It is a placement heuristic, not a hardware benchmark. Common profiles are `general`, `linux`, `storage`, `macos`, and `services`; custom role names work without source changes. Swift and Xcode projects select `macos` automatically. Set a persistent override with `git config ompup.profile PROFILE`.
-
-## OMP environment modes
-
-The default mode is `preserve`. It checks that the selected host can launch OMP, then leaves that host's configuration, plugins, extensions, credentials, and installed version untouched. A hosts-only configuration therefore works without an auth broker:
-
-```json
-{
-  "hosts": [{"name": "compute", "ssh": "compute-box"}]
-}
-```
-
-Set `environment.mode` to `mirror` only when the local machine should manage remote OMP state:
-
-```json
-{
-  "environment": {
-    "mode": "mirror",
-    "include_extensions": ["portable-status.ts"],
-    "exclude_skills": ["private-*"],
-    "plugins": ["portable-plugin"],
-    "auth_host": "compute",
-    "auth_broker_url": "https://broker.example.internal"
-  }
-}
-```
-
-Mirror mode installs a content-addressed release on each selected host. Existing target files move into timestamped backups before replacement. Only explicitly listed extensions and plugins transfer. Skills ignored by local OMP or matched by `exclude_skills` remain local. Common credential files, machine-local state, sessions, memories, caches, databases, MCP definitions, and model files remain local. Every release and project snapshot is scanned with `gitleaks`.
-
-The broker fields are optional and must be configured together. When present, `ompup auth setup` retrieves the token over SSH and stores it under the configured OMP root with mode `0600`. The broker URL should be reachable only through a trusted private network or TLS.
-
-Each host may override `remote_root`, `remote_agent_home`, and `remote_config_root`. All three are safe relative paths below remote `$HOME`. Environment policy is declarative; no extension, plugin, or skill name is hardcoded as portable.
-
-Mirror rollout:
+Upgrade by installing a new exact version; rollback by reinstalling the previous exact version. Do not mix binaries and extension files from different releases:
 
 ```bash
-ompup auth setup             # only when broker fields are configured
-ompup auth migrate --dry-run # optional broker migration
-ompup auth migrate
-ompup env sync --all
-ompup env status --all
+npm install --global ompup@<exact-version>
+# relink the matching unpacked package/source directory if the extension is linked
 ```
 
-## Environment
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OMPUP_CONFIG` | `~/.config/ompup/hosts.json` | Host inventory path |
-| `OMPUP_HOST` | empty | Legacy single-host fallback; use `auto` with a host inventory |
-| `OMPUP_PROJECTS_ROOT` | `~/Projects` | Directory searched by project names and the picker |
-| `OMPUP_REMOTE_ROOT` | `Projects` | Directory under remote `$HOME` for checkouts |
-| `OMPUP_CMD` | host `launch` value | One-invocation remote OMP command override |
-| `OMPUP_EXCLUDES` | unsupported | Use `.gitignore` or `.git/info/exclude` |
-| `OMPUP_AGENT_HOME` | `~/.omp/agent` | Local OMP agent configuration source used by mirror mode |
-| `PI_CONFIG_DIR` | `~/.omp` | Local OMP configuration root and broker-token location |
-
-## Notes
-
-- Project names resolve from the current Git repository, an explicit path, or a case-insensitive directory under `OMPUP_PROJECTS_ROOT`.
-- A directory that is not yet a Git repository is initialized automatically by `ompup`, `ompup sync`, `ompup shell`, and handoff. Home, `OMPUP_PROJECTS_ROOT`, and common personal directories are refused; create a project directory first.
-- `/ompup` subcommands accept any unique prefix, such as `/ompup st` for status.
-- The repository directory name also becomes the tmux session name.
-- In sessions created by `ompup up`, quitting omp drops to a remote shell instead of killing tmux.
-- Fast-forward commits and dirty working trees use negotiated Git object transfer. Divergent history requires normal Git reconciliation.
-- `ompup pull` fetches the remote snapshot as Git objects and may delete local paths when applying its tree, but only when the local checkout exactly matches the recorded baseline.
-- A successful handoff keeps the local session file as a rollback copy. A failed transfer, checksum, remote load, launch, or cmux replacement leaves local OMP running and removes only remote state created by that attempt.
-- Handoff refuses while asynchronous jobs are running because their local processes cannot migrate with the session transcript.
-- Handoff refuses to overwrite an existing project tmux session. Attach that session or select another host.
-- If cmux cannot respawn the calling surface, ompup opens a focused fallback workspace and closes the old surface when cmux can identify it.
+Before changing versions, finish or recover any reported transaction and bring ownership back to the side where you will continue working. v0.2 does not import v0.1 state or paths.
 
 ## License
 

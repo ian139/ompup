@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+: "${OMPUP_FAKE_REMOTE_HOME:?}"
+[ "${OMPUP_FAKE_SSH_FAIL:-0}" != 1 ] || { echo 'fixture ssh failure' >&2; exit 255; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o|-p|-l|-i) shift; [ "$#" -gt 0 ] && shift ;;
+    -t|-T|-n|-q|-x|-y|-4|-6) shift ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+[ "$#" -gt 0 ] || exit 2
+host=$1; shift
+[ -n "$host" ] || exit 2
+[ "$#" -gt 0 ] || exit 0
+cmd=$1; shift
+while [ "$#" -gt 0 ]; do cmd="$cmd $1"; shift; done
+after_fail=0
+if [ -n "${OMPUP_FAKE_SSH_FAIL_AFTER_MATCH:-}" ]; then
+  case "$cmd" in *"$OMPUP_FAKE_SSH_FAIL_AFTER_MATCH"*) after_fail=1 ;; esac
+fi
+if [ -n "${OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH:-}" ]; then
+  case "$cmd" in
+    *"$OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH"*)
+      lock=$(find "$OMPUP_FAKE_REMOTE_HOME/Projects/.ompup-v2/locks" -type d -name '*.lock' -print -quit)
+      [ -n "$lock" ] || { echo 'fixture could not locate remote lock' >&2; exit 96; }
+      address=${lock##*/}; address=${address%.lock}
+      mkdir "$OMPUP_FAKE_REMOTE_HOME/Projects/$address"
+      printf 'concurrent\n' > "$OMPUP_FAKE_REMOTE_HOME/Projects/$address/concurrent.txt"
+      ;;
+  esac
+fi
+if [ -n "${OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH:-}" ]; then
+  case "$cmd" in
+    *"$OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH"*)
+      if [ ! -e "$OMPUP_FAKE_SSH_GIT_COMMIT_STAMP" ]; then
+        : > "$OMPUP_FAKE_SSH_GIT_COMMIT_STAMP"
+        git -C "$OMPUP_FAKE_SSH_GIT_PROJECT" commit --allow-empty -m concurrent-metadata >/dev/null
+      fi ;;
+  esac
+fi
+if [ -n "${OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH:-}" ]; then
+  case "$cmd" in
+    *"$OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH"*)
+      target=$OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET
+      lock=$(find "$OMPUP_FAKE_REMOTE_HOME/Projects/.ompup-v2/locks" -type d -name '*.lock' -print -quit)
+      address=${lock##*/}; address=${address%.lock}
+      control="$OMPUP_FAKE_REMOTE_HOME/Projects/.ompup-v2/$address"
+      case "$OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND" in
+        candidate_tree)
+          container=$(find "$OMPUP_FAKE_REMOTE_HOME/Projects" -maxdepth 1 -type d -name '.ompup-candidate-*' -print -quit)
+          [ -n "$container" ] || exit 97
+          ln -s "$target" "$container/tree" ;;
+        candidate_container)
+          container=$(find "$OMPUP_FAKE_REMOTE_HOME/Projects" -maxdepth 1 -type d -name '.ompup-candidate-*' -print -quit)
+          [ -n "$container" ] || exit 97
+          /bin/mv "$container" "$container.displaced"
+          ln -s "$target" "$container" ;;
+        backup_tree)
+          container=$(find "$OMPUP_FAKE_REMOTE_HOME/Projects" -maxdepth 1 -type d -name '.ompup-backup-*' -print -quit)
+          [ -n "$container" ] || exit 97
+          ln -s "$target" "$container/tree" ;;
+        journal|marker|state)
+          journal=$(find "$XDG_STATE_HOME/ompup/targets" -type f -path '*/transactions/*/journal' -print -quit)
+          [ -n "$journal" ] || { echo 'fixture could not locate local journal' >&2; exit 97; }
+          txn=${journal%/journal}; token=${txn##*/}; project_state=${txn%/transactions/*}
+          case "$OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND" in
+            journal) mkdir -p "$control/txn"; ln -s "$target" "$control/txn/$token" ;;
+            marker) mkdir -p "$control"; ln -s "$target/value" "$control/marker.tmp.$token"; ln -s "$target" "$control/.marker-tmp-$token" ;;
+            state) ln -s "$target/value" "$project_state/.state.$token"; ln -s "$target" "$project_state/.state-tmp-$token" ;;
+          esac ;;
+        *) echo 'unknown fixture symlink attack' >&2; exit 98 ;;
+      esac ;;
+  esac
+fi
+if [ -n "${OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH:-}" ] && [ -n "${OMPUP_FAKE_SSH_MUTATE_PATH:-}" ]; then
+  case "$cmd" in
+    *"$OMPUP_FAKE_SSH_MUTATE_BEFORE_MATCH"*)
+      mkdir -p "$(dirname "$OMPUP_FAKE_SSH_MUTATE_PATH")"
+      printf 'concurrent\n' > "$OMPUP_FAKE_SSH_MUTATE_PATH" ;;
+  esac
+fi
+if [ -n "${OMPUP_FAKE_SSH_FAIL_MATCH:-}" ]; then
+  case "$cmd" in *"$OMPUP_FAKE_SSH_FAIL_MATCH"*) echo "fixture matched failure" >&2; exit 255 ;; esac
+fi
+[ -z "${OMPUP_FAKE_SSH_LOG:-}" ] || printf '%s\n' "$cmd" >> "$OMPUP_FAKE_SSH_LOG"
+cd "$OMPUP_FAKE_REMOTE_HOME"
+HOME=$OMPUP_FAKE_REMOTE_HOME export HOME
+unset OMPUP_FAKE_MV_FAIL_AFTER_BACKUP OMPUP_FAKE_MV_MUTATE_BEFORE_BACKUP
+unset OMPUP_FAKE_SSH_CREATE_DEST_BEFORE_MATCH OMPUP_FAKE_SSH_GIT_COMMIT_BEFORE_MATCH
+unset OMPUP_FAKE_SSH_GIT_COMMIT_STAMP OMPUP_FAKE_SSH_GIT_PROJECT
+unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_BEFORE_MATCH OMPUP_FAKE_SSH_SYMLINK_ATTACK_KIND
+unset OMPUP_FAKE_SSH_SYMLINK_ATTACK_TARGET
+/bin/bash -c "$cmd"
+rc=$?
+[ "$after_fail" -eq 0 ] || { echo "fixture failed after matched command" >&2; exit 255; }
+exit "$rc"
